@@ -43,27 +43,30 @@ const App: React.FC = () => {
     net: { label: '净增行数', color: '#1890ff' }
   };
 
-  // 0. 初始自动加载本地目录数据
+  // 0. 初始自动加载本地 data 目录数据
   useEffect(() => {
     const loadLocalData = () => {
-      const defaultModules = import.meta.glob('../*/*.csv', { query: '?raw', import: 'default', eager: true });
+      // 仅扫描根目录下的 data 文件夹
+      const defaultModules = import.meta.glob('../data/**/*.csv', { query: '?raw', import: 'default', eager: true });
       const initialFiles: FileInfo[] = [];
       
       for (const [path, content] of Object.entries(defaultModules)) {
-        if (path.includes('node_modules') || path.includes('dist')) continue;
         const pathParts = path.split('/');
-        const parentFolder = pathParts.length >= 2 ? pathParts[pathParts.length - 2] : '未分类';
+        // 路径示例: ../data/ProjectA/1.csv -> pathParts = ['', '..', 'data', 'ProjectA', '1.csv']
+        // 我们取 data 文件夹后的第一个文件夹名
+        const groupName = pathParts.length >= 4 ? pathParts[pathParts.indexOf('data') + 1] : '默认工程';
+        
         initialFiles.push({
-          name: path.replace('../', ''), 
+          name: path.replace('../data/', ''), 
           path,
           content: content as string,
-          groupName: parentFolder
+          groupName: groupName
         });
       }
 
       if (initialFiles.length > 0) {
         setRawFiles(initialFiles);
-        message.success(`已自动加载了 ${initialFiles.length} 个本地分析文件`);
+        message.success(`已从 data 目录自动加载了 ${initialFiles.length} 个分析文件`);
       }
     };
     loadLocalData();
