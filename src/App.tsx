@@ -256,7 +256,7 @@ const App: React.FC = () => {
     }));
     return {
       tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
-      legend: { bottom: 0 },
+      legend: { data: targetMonthsForAnalysis, bottom: 0 },
       xAxis: { type: 'value', name: metricLabels[metric].label },
       yAxis: { type: 'category', data: displayData.map(d => d.author) },
       series
