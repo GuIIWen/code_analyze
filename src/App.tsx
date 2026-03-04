@@ -365,7 +365,7 @@ const App: React.FC = () => {
                 <Col span={6}><Card><Statistic title="总提交" value={filteredStats.totalCommits} /></Card></Col>
               </Row>
 
-              <Card title={`月度趋势对比 (${metricLabels[metric].label})`}><ReactECharts option={trendOption} style={{ height: 380 }} /></Card>
+              <Card title={`月度趋势对比 (${metricLabels[metric].label})`}><ReactECharts option={trendOption} style={{ height: 380 }} notMerge={true} /></Card>
 
               <Tabs type="card" items={[
                 { key: '1', label: '工程维度', children: (
@@ -388,7 +388,7 @@ const App: React.FC = () => {
                     <Space style={{ marginBottom: 16 }}><Text strong>显示排名人数：</Text>
                       <Select value={topN} onChange={setTopN} style={{ width: 120 }} options={[{ label: 'Top 10', value: 10 }, { label: 'Top 20', value: 20 }, { label: 'Top 50', value: 50 }, { label: '全部', value: authorRanking.length }]} />
                     </Space>
-                    <ReactECharts option={authorRankingChartOption} style={{ height: Math.max(350, Math.min(topN, authorRanking.length) * 30), marginBottom: 24 }} />
+                    <ReactECharts option={authorRankingChartOption} style={{ height: Math.max(350, Math.min(topN, authorRanking.length) * 30), marginBottom: 24 }} notMerge={true} />
                     <Table dataSource={authorRanking} size="small" columns={[
                       { title: '排名', render: (_1, _2, index) => index + 1, width: 60 },
                       { title: '作者', dataIndex: 'author' },
@@ -412,7 +412,7 @@ const App: React.FC = () => {
                     <Space style={{ marginBottom: 16 }}><Text strong>选择要查看的人员：</Text>
                       <Select showSearch value={selectedAuthor} onChange={setSelectedAuthor} style={{ width: 250 }} options={allAuthors.map(a => ({ label: String(a), value: String(a) }))} />
                     </Space>
-                    <ReactECharts option={authorChartOption} style={{ height: 300, marginBottom: 24 }} />
+                    <ReactECharts option={authorChartOption} style={{ height: 300, marginBottom: 24 }} notMerge={true} />
                     <Table dataSource={authorTableData} size="small" columns={[
                       { title: '月份', dataIndex: 'month', sorter: (a: any, b: any) => a.month.localeCompare(b.month), defaultSortOrder: 'descend' },
                       { title: '工程', dataIndex: 'group' }, { title: '模块', dataIndex: 'project' },
@@ -426,7 +426,7 @@ const App: React.FC = () => {
                       <Space><Text strong>对比人员：</Text><Select mode="multiple" showSearch allowClear value={monthlySelectedAuthors} onChange={setMonthlySelectedAuthors} style={{ minWidth: 200, maxWidth: 400 }} options={allAuthors.map(a => ({ label: String(a), value: String(a) }))} /></Space>
                       <Space style={{ marginLeft: 16 }}><Text strong>对比月份：</Text><Select mode="multiple" showSearch allowClear value={monthlySelectedMonths} onChange={setMonthlySelectedMonths} style={{ minWidth: 200, maxWidth: 400 }} options={filteredStats?.allMonths.map(m => ({ label: m, value: m }))} /></Space>
                     </Space>
-                    <ReactECharts option={monthlyAnalysisChartOption} style={{ height: Math.max(350, (monthlySelectedAuthors.length || 15) * 35), marginBottom: 24 }} />
+                    <ReactECharts option={monthlyAnalysisChartOption} style={{ height: Math.max(350, (monthlySelectedAuthors.length || 15) * 35), marginBottom: 24 }} notMerge={true} />
                     <Table dataSource={monthlyAnalysisPivot} size="small" scroll={{ x: 'max-content' }} columns={[
                       { title: '作者', dataIndex: 'author', fixed: 'left' },
                       ...targetMonthsForAnalysis.map(month => ({ title: month, dataIndex: month, render: (v: any) => v || '-', sorter: (a: any, b: any) => (a[month] || 0) - (b[month] || 0) })),
