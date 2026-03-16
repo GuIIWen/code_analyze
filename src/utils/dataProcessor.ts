@@ -45,7 +45,22 @@ export interface AggregatedStats {
   groupStats: any[];
 }
 
-export const processCSVFiles = async (files: FileInfo[], authorMapping: Record<string, string> = {}): Promise<AggregatedStats> => {
+export interface DashboardStats extends AggregatedStats {
+  projectMeta?: {
+    id?: number;
+    name?: string;
+    gitUrl?: string;
+  };
+  branchMeta?: {
+    name?: string;
+  };
+  runMeta?: {
+    id?: number;
+    commitSha?: string;
+  };
+}
+
+export const processCSVFiles = async (files: FileInfo[], authorMapping: Record<string, string> = {}): Promise<DashboardStats> => {
   let allRecords: CleanRecord[] = [];
 
   for (const file of files) {

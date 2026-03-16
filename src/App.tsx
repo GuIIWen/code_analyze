@@ -1,31 +1,151 @@
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
-import { 
-  Layout, Upload, Card, Row, Col, Statistic, Table, Typography, Space, message, Select, Input, Tabs, Button, List, Checkbox, Switch, Spin 
+import {
+  Alert,
+  Button,
+  Card,
+  Checkbox,
+  Col,
+  Input,
+  Layout,
+  List,
+  Row,
+  Segmented,
+  Select,
+  Space,
+  Spin,
+  Statistic,
+  Switch,
+  Table,
+  Tabs,
+  Tag,
+  Typography,
+  Upload,
+  message
 } from 'antd';
-import { 
-  InboxOutlined, UserOutlined, SettingOutlined, DeleteOutlined, FilterOutlined, RobotOutlined, 
-  LineChartOutlined, DeploymentUnitOutlined 
+import {
+  ApiOutlined,
+  DeleteOutlined,
+  FilterOutlined,
+  InboxOutlined,
+  ReloadOutlined,
+  RobotOutlined,
+  SettingOutlined,
+  UserOutlined
 } from '@ant-design/icons';
 import ReactECharts from 'echarts-for-react';
 import _ from 'lodash';
-import { processCSVFiles, AggregatedStats, FileInfo } from './utils/dataProcessor';
 import authorMapping from '../author_mapping.json';
+import {
+  BranchSummary,
+  ProjectSummary,
+  RunSummary,
+  clearProjectCache,
+  createBranch,
+  createProject,
+  deleteProject,
+  getLatestBranchResult,
+  getProjectCache,
+  getProjectDetail,
+  getRun,
+  healthCheck,
+  listProjects,
+  triggerBranchUpdate
+} from './utils/api';
+import { AggregatedStats, DashboardStats, FileInfo, processCSVFiles } from './utils/dataProcessor';
 
 const { Header, Content } = Layout;
 const { Dragger } = Upload;
 const { Title, Text } = Typography;
 
+type MetricKey = 'added' | 'deleted' | 'net';
+type DataSourceMode = 'service' | 'csv';
+
+const metricLabels: Record<MetricKey, { label: string; color: string }> = {
+  added: { label: '新增行数', color: '#52c41a' },
+  deleted: { label: '删除行数', color: '#ff4d4f' },
+  net: { label: '净增行数', color: '#1890ff' }
+};
+
+const runStatusColors: Record<string, string> = {
+  queued: 'default',
+  cloning: 'processing',
+  fetching: 'processing',
+  analyzing: 'processing',
+  succeeded: 'success',
+  failed: 'error',
+  canceled: 'warning'
+};
+
+const isUndefinedValue = (value: unknown) => {
+  const text = String(value ?? '').trim().toLowerCase();
+  return !value || text === 'undefined' || text === 'null' || text === '未知' || text === '-' || text === '总计' || text === '';
+};
+
+const getInitialGroups = (stats: AggregatedStats | null, showUndefined: boolean) => {
+  if (!stats) {
+    return [];
+  }
+  return stats.allGroups.filter(group => (showUndefined ? true : !isUndefinedValue(group)));
+};
+
+const sleep = (ms: number) => new Promise(resolve => window.setTimeout(resolve, ms));
+
+const formatTime = (value?: string | null) => {
+  if (!value) {
+    return '暂无';
+  }
+  return new Date(value).toLocaleString();
+};
+
+const formatBytes = (value?: number) => {
+  if (!value) {
+    return '0 B';
+  }
+  if (value < 1024) {
+    return `${value} B`;
+  }
+  if (value < 1024 * 1024) {
+    return `${(value / 1024).toFixed(1)} KB`;
+  }
+  if (value < 1024 * 1024 * 1024) {
+    return `${(value / 1024 / 1024).toFixed(1)} MB`;
+  }
+  return `${(value / 1024 / 1024 / 1024).toFixed(1)} GB`;
+};
+
 const App: React.FC = () => {
   const [rawFiles, setRawFiles] = useState<FileInfo[]>([]);
-  const [baseStats, setBaseStats] = useState<AggregatedStats | null>(null);
+  const [localStats, setLocalStats] = useState<DashboardStats | null>(null);
+  const [remoteStats, setRemoteStats] = useState<DashboardStats | null>(null);
+  const [dataSourceMode, setDataSourceMode] = useState<DataSourceMode>('service');
   const [selectedGroups, setSelectedGroups] = useState<string[]>([]);
-  const [metric, setMetric] = useState<'added' | 'deleted' | 'net'>('added');
+  const [metric, setMetric] = useState<MetricKey>('added');
   const [selectedAuthor, setSelectedAuthor] = useState<string | undefined>(undefined);
   const [showUndefined, setShowUndefined] = useState<boolean>(false);
   const [topN, setTopN] = useState<number>(10);
-  const [monthlySelectedAuthors, setMonthlySelectedAuthors] = useState<string[]>([]); 
-  const [monthlySelectedMonths, setMonthlySelectedMonths] = useState<string[]>([]); 
+  const [monthlySelectedAuthors, setMonthlySelectedAuthors] = useState<string[]>([]);
+  const [monthlySelectedMonths, setMonthlySelectedMonths] = useState<string[]>([]);
+
+  const [serviceAvailable, setServiceAvailable] = useState<boolean | null>(null);
+  const [serviceHint, setServiceHint] = useState<string>('正在检查后端服务...');
+  const [serviceBusy, setServiceBusy] = useState<boolean>(false);
+  const [projects, setProjects] = useState<ProjectSummary[]>([]);
+  const [branches, setBranches] = useState<BranchSummary[]>([]);
+  const [selectedProjectId, setSelectedProjectId] = useState<number | undefined>(undefined);
+  const [selectedBranchId, setSelectedBranchId] = useState<number | undefined>(undefined);
+  const [activeRun, setActiveRun] = useState<RunSummary | null>(null);
+  const [cacheInfo, setCacheInfo] = useState<{
+    local_repo_path: string;
+    exists: boolean;
+    size_bytes: number;
+    last_fetched_at?: string | null;
+  } | null>(null);
+
+  const [newProjectName, setNewProjectName] = useState<string>('');
+  const [newGitUrl, setNewGitUrl] = useState<string>('');
+  const [newDefaultBranch, setNewDefaultBranch] = useState<string>('main');
+  const [newBranchName, setNewBranchName] = useState<string>('');
 
   // AI 相关状态
   const [aiApiKey, setAiApiKey] = useState<string>(localStorage.getItem('ai_api_key') || '');
@@ -37,96 +157,199 @@ const App: React.FC = () => {
   const [aiTargetItems, setAiTargetItems] = useState<string[]>([]);
   const [aiCustomFocus, setAiCustomFocus] = useState<string>('');
 
-  const metricLabels = {
-    added: { label: '新增行数', color: '#52c41a' },
-    deleted: { label: '删除行数', color: '#ff4d4f' },
-    net: { label: '净增行数', color: '#1890ff' }
+  const baseStats = useMemo(
+    () => (dataSourceMode === 'service' ? remoteStats : localStats),
+    [dataSourceMode, localStats, remoteStats]
+  );
+
+  const selectedProject = useMemo(
+    () => projects.find(project => project.id === selectedProjectId),
+    [projects, selectedProjectId]
+  );
+
+  const selectedBranch = useMemo(
+    () => branches.find(branch => branch.id === selectedBranchId),
+    [branches, selectedBranchId]
+  );
+
+  const loadLatestResult = async (projectId: number, branchId: number, notify = true) => {
+    try {
+      const result = await getLatestBranchResult(projectId, branchId);
+      setRemoteStats(result);
+      setDataSourceMode('service');
+      if (notify) {
+        message.success('已加载最新分析结果');
+      }
+    } catch (error) {
+      setRemoteStats(null);
+      if (notify) {
+        message.warning(error instanceof Error ? error.message : '该分支暂无分析结果');
+      }
+    }
   };
 
-  // 0. 初始自动加载本地 data 目录数据
+  const loadProjectContext = async (
+    projectId: number,
+    preferredBranchId?: number,
+    autoLoadLatestResult = true
+  ) => {
+    const [detail, cache] = await Promise.all([
+      getProjectDetail(projectId),
+      getProjectCache(projectId)
+    ]);
+
+    setBranches(detail.branches);
+    setCacheInfo(cache);
+
+    if (detail.branches.length === 0) {
+      setSelectedBranchId(undefined);
+      setRemoteStats(null);
+      return;
+    }
+
+    const branchId =
+      preferredBranchId && detail.branches.some(branch => branch.id === preferredBranchId)
+        ? preferredBranchId
+        : selectedBranchId && detail.branches.some(branch => branch.id === selectedBranchId)
+          ? selectedBranchId
+          : detail.branches.find(branch => branch.is_default)?.id || detail.branches[0].id;
+
+    setSelectedBranchId(branchId);
+    if (autoLoadLatestResult) {
+      await loadLatestResult(projectId, branchId, false);
+    }
+  };
+
+  const refreshProjects = async (preferredProjectId?: number, preferredBranchId?: number) => {
+    const items = await listProjects();
+    setProjects(items);
+
+    if (items.length === 0) {
+      setSelectedProjectId(undefined);
+      setSelectedBranchId(undefined);
+      setBranches([]);
+      setCacheInfo(null);
+      if (dataSourceMode === 'service') {
+        setRemoteStats(null);
+      }
+      return;
+    }
+
+    const nextProjectId =
+      preferredProjectId && items.some(project => project.id === preferredProjectId)
+        ? preferredProjectId
+        : selectedProjectId && items.some(project => project.id === selectedProjectId)
+          ? selectedProjectId
+          : items[0].id;
+
+    setSelectedProjectId(nextProjectId);
+    await loadProjectContext(nextProjectId, preferredBranchId);
+  };
+
+  const bootstrapService = async () => {
+    try {
+      await healthCheck();
+      setServiceAvailable(true);
+      setServiceHint('后端服务在线，可以直接通过 Git 地址创建项目并触发分析。');
+      await refreshProjects();
+    } catch (error) {
+      setServiceAvailable(false);
+      setServiceHint(error instanceof Error ? error.message : '后端服务暂不可用');
+      setDataSourceMode('csv');
+    }
+  };
+
   useEffect(() => {
     const loadLocalData = () => {
-      // 仅扫描根目录下的 data 文件夹
       const defaultModules = import.meta.glob('../data/**/*.csv', { query: '?raw', import: 'default', eager: true });
       const initialFiles: FileInfo[] = [];
-      
+
       for (const [path, content] of Object.entries(defaultModules)) {
         const pathParts = path.split('/');
-        // 路径示例: ../data/ProjectA/1.csv -> pathParts = ['', '..', 'data', 'ProjectA', '1.csv']
-        // 我们取 data 文件夹后的第一个文件夹名
         const groupName = pathParts.length >= 4 ? pathParts[pathParts.indexOf('data') + 1] : '默认工程';
-        
+
         initialFiles.push({
-          name: path.replace('../data/', ''), 
+          name: path.replace('../data/', ''),
           path,
           content: content as string,
-          groupName: groupName
+          groupName
         });
       }
 
       if (initialFiles.length > 0) {
         setRawFiles(initialFiles);
-        message.success(`已从 data 目录自动加载了 ${initialFiles.length} 个分析文件`);
       }
     };
+
     loadLocalData();
+    bootstrapService().catch(() => {
+      setServiceAvailable(false);
+      setServiceHint('后端服务检查失败');
+      setDataSourceMode('csv');
+    });
   }, []);
 
-  // 1. 基础解析逻辑
   useEffect(() => {
     if (rawFiles.length > 0) {
-      processCSVFiles(rawFiles, authorMapping).then(res => {
-        setBaseStats(res);
-        const initialGroups = res.allGroups.filter(g => {
-          if (!showUndefined) {
-            const s = String(g).toLowerCase();
-            return s !== 'undefined' && s !== 'null' && s !== '未知' && s !== '';
-          }
-          return true;
-        });
-        setSelectedGroups(initialGroups);
+      processCSVFiles(rawFiles, authorMapping).then(result => {
+        setLocalStats(result);
       });
-    } else {
-      setBaseStats(null);
-      setSelectedGroups([]);
+      return;
     }
-  }, [rawFiles, showUndefined]);
+    setLocalStats(null);
+  }, [rawFiles]);
 
-  // 2. 核心：全局过滤后的数据
+  useEffect(() => {
+    setSelectedGroups(getInitialGroups(baseStats, showUndefined));
+  }, [baseStats, showUndefined]);
+
   const filteredStats = useMemo(() => {
-    if (!baseStats || selectedGroups.length === 0) return null;
+    if (!baseStats || selectedGroups.length === 0) {
+      return null;
+    }
 
-    const filteredFullData = baseStats.fullData.filter(r => {
-      if (!selectedGroups.includes(r.group)) return false;
+    const filteredFullData = baseStats.fullData.filter(record => {
+      if (!selectedGroups.includes(record.group)) {
+        return false;
+      }
       if (!showUndefined) {
-        const isUndef = (val: any) => {
-          const s = String(val).trim().toLowerCase();
-          return !val || s === 'undefined' || s === 'null' || s === '未知' || s === '-' || s === '总计' || s === '';
-        };
-        if (isUndef(r.author) || isUndef(r.project) || isUndef(r.group) || isUndef(r.month)) return false;
+        if (
+          isUndefinedValue(record.author) ||
+          isUndefinedValue(record.project) ||
+          isUndefinedValue(record.group) ||
+          isUndefinedValue(record.month)
+        ) {
+          return false;
+        }
       }
       return true;
     });
 
-    const activeMonths = _.uniq(filteredFullData.map(r => String(r.month))).sort();
-    const activeGroups = _.uniq(filteredFullData.map(r => r.group));
+    const activeMonths = _.uniq(filteredFullData.map(record => String(record.month))).sort();
+    const activeGroups = _.uniq(filteredFullData.map(record => record.group));
 
     const monthlyTrends = activeMonths.map(month => {
-      const records = filteredFullData.filter(r => String(r.month) === month);
+      const records = filteredFullData.filter(record => String(record.month) === month);
       return {
         month,
         added: _.sumBy(records, 'added'),
         deleted: _.sumBy(records, 'deleted'),
         net: _.sumBy(records, 'net'),
-        commits: _.sumBy(records, 'commits'),
+        commits: _.sumBy(records, 'commits')
       };
     });
 
     const groupMonthlyTrends: Record<string, any[]> = {};
     activeGroups.forEach(group => {
       groupMonthlyTrends[group] = activeMonths.map(month => {
-        const records = filteredFullData.filter(r => r.group === group && String(r.month) === month);
-        return { month, added: _.sumBy(records, 'added'), deleted: _.sumBy(records, 'deleted'), net: _.sumBy(records, 'net'), commits: _.sumBy(records, 'commits') };
+        const records = filteredFullData.filter(record => record.group === group && String(record.month) === month);
+        return {
+          month,
+          added: _.sumBy(records, 'added'),
+          deleted: _.sumBy(records, 'deleted'),
+          net: _.sumBy(records, 'net'),
+          commits: _.sumBy(records, 'commits')
+        };
       });
     });
 
@@ -142,27 +365,32 @@ const App: React.FC = () => {
       activeGroups,
       allMonths: activeMonths,
       fullData: filteredFullData,
-      groupStats: baseStats.groupStats.filter(g => activeGroups.includes(g.group)),
-      projectStats: baseStats.projectStats.filter(p => activeGroups.includes(p.group)),
-      authorProjectStats: baseStats.authorProjectStats.filter(ap => activeGroups.includes(ap.group))
+      groupStats: baseStats.groupStats.filter(group => activeGroups.includes(group.group)),
+      projectStats: baseStats.projectStats.filter(project => activeGroups.includes(project.group)),
+      authorProjectStats: baseStats.authorProjectStats.filter(item => activeGroups.includes(item.group))
     };
   }, [baseStats, selectedGroups, showUndefined]);
 
-  // 3. 计算人员排名
   const authorRanking = useMemo(() => {
-    if (!filteredStats) return [];
+    if (!filteredStats) {
+      return [];
+    }
     const grouped = _.groupBy(filteredStats.fullData, 'author');
-    return Object.entries(grouped).map(([author, records]) => ({
-      author,
-      added: _.sumBy(records, 'added'),
-      deleted: _.sumBy(records, 'deleted'),
-      net: _.sumBy(records, 'net'),
-      commits: _.sumBy(records, 'commits'),
-    })).sort((a, b) => b[metric] - a[metric]);
+    return Object.entries(grouped)
+      .map(([author, records]) => ({
+        author,
+        added: _.sumBy(records, 'added'),
+        deleted: _.sumBy(records, 'deleted'),
+        net: _.sumBy(records, 'net'),
+        commits: _.sumBy(records, 'commits')
+      }))
+      .sort((a, b) => b[metric] - a[metric]);
   }, [filteredStats, metric]);
 
   const authorRankingChartOption = useMemo(() => {
-    if (!authorRanking || authorRanking.length === 0) return {};
+    if (authorRanking.length === 0) {
+      return {};
+    }
     const topData = [...authorRanking].slice(0, topN).reverse();
     return {
       tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
@@ -179,10 +407,11 @@ const App: React.FC = () => {
     };
   }, [authorRanking, metric, topN]);
 
-  // 4. 个人明细
   const allAuthors = useMemo(() => {
-    if (!filteredStats) return [];
-    return _.uniq(filteredStats.fullData.map(r => String(r.author))).sort();
+    if (!filteredStats) {
+      return [];
+    }
+    return _.uniq(filteredStats.fullData.map(record => String(record.author))).sort();
   }, [filteredStats]);
 
   useEffect(() => {
@@ -192,10 +421,12 @@ const App: React.FC = () => {
   }, [allAuthors, selectedAuthor]);
 
   const authorChartOption = useMemo(() => {
-    if (!filteredStats || !selectedAuthor) return {};
-    const authorData = filteredStats.fullData.filter(r => r.author === selectedAuthor);
+    if (!filteredStats || !selectedAuthor) {
+      return {};
+    }
+    const authorData = filteredStats.fullData.filter(record => record.author === selectedAuthor);
     const monthlyData = filteredStats.allMonths.map(month => {
-      const records = authorData.filter(r => r.month === month);
+      const records = authorData.filter(record => record.month === month);
       return { month, value: _.sumBy(records, metric) };
     });
     return {
@@ -204,73 +435,131 @@ const App: React.FC = () => {
       xAxis: { type: 'category', boundaryGap: false, data: filteredStats.allMonths },
       yAxis: { type: 'value', name: metricLabels[metric].label },
       series: [{
-        name: metricLabels[metric].label, type: 'line', smooth: true, areaStyle: { opacity: 0.2 },
-        itemStyle: { color: metricLabels[metric].color }, data: monthlyData.map(d => d.value)
+        name: metricLabels[metric].label,
+        type: 'line',
+        smooth: true,
+        areaStyle: { opacity: 0.2 },
+        itemStyle: { color: metricLabels[metric].color },
+        data: monthlyData.map(item => item.value)
       }]
     };
-  }, [filteredStats, selectedAuthor, metric]);
+  }, [filteredStats, metric, selectedAuthor]);
 
   const authorTableData = useMemo(() => {
-    if (!filteredStats || !selectedAuthor) return [];
-    const authorData = filteredStats.fullData.filter(r => r.author === selectedAuthor);
-    return Object.entries(_.groupBy(authorData, r => `${r.month}-${r.group}-${r.project}`)).map(([key, records]) => ({
-      key,
-      month: records[0].month,
-      group: records[0].group,
-      project: records[0].project,
-      added: _.sumBy(records, 'added'),
-      deleted: _.sumBy(records, 'deleted'),
-      net: _.sumBy(records, 'net'),
-      commits: _.sumBy(records, 'commits'),
-    })).sort((a, b) => b.month.localeCompare(a.month));
+    if (!filteredStats || !selectedAuthor) {
+      return [];
+    }
+    const authorData = filteredStats.fullData.filter(record => record.author === selectedAuthor);
+    return Object.entries(_.groupBy(authorData, record => `${record.month}-${record.group}-${record.project}`))
+      .map(([key, records]) => ({
+        key,
+        month: records[0].month,
+        group: records[0].group,
+        project: records[0].project,
+        added: _.sumBy(records, 'added'),
+        deleted: _.sumBy(records, 'deleted'),
+        net: _.sumBy(records, 'net'),
+        commits: _.sumBy(records, 'commits')
+      }))
+      .sort((a, b) => b.month.localeCompare(a.month));
   }, [filteredStats, selectedAuthor]);
 
-  // 5. 月度横向对比
   const targetMonthsForAnalysis = useMemo(() => {
-    if (!filteredStats) return [];
+    if (!filteredStats) {
+      return [];
+    }
     return monthlySelectedMonths.length > 0 ? monthlySelectedMonths : filteredStats.allMonths;
   }, [filteredStats, monthlySelectedMonths]);
 
   const monthlyAnalysisPivot = useMemo(() => {
-    if (!filteredStats) return [];
+    if (!filteredStats) {
+      return [];
+    }
     const targetAuthors = monthlySelectedAuthors.length > 0 ? monthlySelectedAuthors : allAuthors;
-    const targetData = filteredStats.fullData.filter(r => targetAuthors.includes(r.author));
-    return Object.entries(_.groupBy(targetData, 'author')).map(([author, records]) => {
-      const row: any = {
-        key: author, author,
-        total: _.sumBy(records.filter(r => targetMonthsForAnalysis.includes(r.month)), metric)
-      };
-      targetMonthsForAnalysis.forEach(month => {
-        row[month] = _.sumBy(records.filter(r => r.month === month), metric);
-      });
-      return row;
-    }).sort((a, b) => b.total - a.total);
-  }, [filteredStats, monthlySelectedAuthors, targetMonthsForAnalysis, metric, allAuthors]);
+    const targetData = filteredStats.fullData.filter(record => targetAuthors.includes(record.author));
+    return Object.entries(_.groupBy(targetData, 'author'))
+      .map(([author, records]) => {
+        const row: Record<string, number | string> = {
+          key: author,
+          author,
+          total: _.sumBy(records.filter(record => targetMonthsForAnalysis.includes(record.month)), metric)
+        };
+        targetMonthsForAnalysis.forEach(month => {
+          row[month] = _.sumBy(records.filter(record => record.month === month), metric);
+        });
+        return row;
+      })
+      .sort((a, b) => Number(b.total) - Number(a.total));
+  }, [allAuthors, filteredStats, metric, monthlySelectedAuthors, targetMonthsForAnalysis]);
 
   const monthlyAnalysisChartOption = useMemo(() => {
-    if (!filteredStats || monthlyAnalysisPivot.length === 0) return {};
-    const displayData = monthlySelectedAuthors.length > 0 ? [...monthlyAnalysisPivot].reverse() : [...monthlyAnalysisPivot].slice(0, 15).reverse();
+    if (!filteredStats || monthlyAnalysisPivot.length === 0) {
+      return {};
+    }
+    const displayData =
+      monthlySelectedAuthors.length > 0
+        ? [...monthlyAnalysisPivot].reverse()
+        : [...monthlyAnalysisPivot].slice(0, 15).reverse();
     const series = targetMonthsForAnalysis.map(month => ({
-      name: month, type: 'bar', stack: 'total', emphasis: { focus: 'series' },
-      data: displayData.map((d: any) => d[month] || 0)
+      name: month,
+      type: 'bar',
+      stack: 'total',
+      emphasis: { focus: 'series' },
+      data: displayData.map(item => Number(item[month] || 0))
     }));
     return {
       tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
       legend: { data: targetMonthsForAnalysis, bottom: 0 },
       xAxis: { type: 'value', name: metricLabels[metric].label },
-      yAxis: { type: 'category', data: displayData.map(d => d.author) },
+      yAxis: { type: 'category', data: displayData.map(item => item.author) },
       series
     };
-  }, [monthlyAnalysisPivot, targetMonthsForAnalysis, metric, monthlySelectedAuthors]);
+  }, [filteredStats, metric, monthlyAnalysisPivot, monthlySelectedAuthors.length, targetMonthsForAnalysis]);
 
-  // 6. AI 分析
+  const trendOption = useMemo(() => {
+    if (!filteredStats) {
+      return {};
+    }
+    const series = filteredStats.activeGroups.map(group => ({
+      name: group,
+      type: 'bar',
+      stack: 'total',
+      emphasis: { focus: 'series' },
+      data: filteredStats.groupMonthlyTrends[group]?.map(item => item[metric]) || []
+    }));
+    series.push({
+      name: '总Commit数',
+      type: 'line',
+      yAxisIndex: 1,
+      data: filteredStats.monthlyTrends.map(item => item.commits)
+    } as any);
+    return {
+      tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
+      legend: { bottom: 0 },
+      xAxis: { type: 'category', data: filteredStats.allMonths },
+      yAxis: [
+        { type: 'value', name: metricLabels[metric].label },
+        { type: 'value', name: '提交数', position: 'right' }
+      ],
+      series
+    };
+  }, [filteredStats, metric]);
+
   const handleAiAnalysis = async () => {
-    if (!aiApiKey) { message.warning('请配置 API Key'); return; }
-    if (!filteredStats) return;
-    setIsAiLoading(true); setAiAnalysis('');
-    const prompt = `你是一位研发效能专家。指标:${metricLabels[metric].label}。数据:\n` + 
-      filteredStats.groupStats.map(g => `${g.group}:产出${g[metric]}`).join('\n') + 
-      `Top5:${authorRanking.slice(0, 5).map(a => `${a.author}:${a[metric]}`).join(',')}\n请分析态势、分布、建议。使用Markdown。`;
+    if (!aiApiKey) {
+      message.warning('请配置 API Key');
+      return;
+    }
+    if (!filteredStats) {
+      return;
+    }
+    setIsAiLoading(true);
+    setAiAnalysis('');
+    const prompt =
+      `你是一位研发效能专家。指标:${metricLabels[metric].label}。数据:\n` +
+      filteredStats.groupStats.map(group => `${group.group}:产出${group[metric]}`).join('\n') +
+      `\nTop5:${authorRanking.slice(0, 5).map(author => `${author.author}:${author[metric]}`).join(',')}` +
+      `\n请分析态势、分布、建议。使用Markdown。`;
     try {
       const response = await fetch(aiApiUrl, {
         method: 'POST',
@@ -279,50 +568,237 @@ const App: React.FC = () => {
       });
       const data = await response.json();
       setAiAnalysis(data.choices?.[0]?.message?.content || '分析失败');
-    } catch (err: any) { message.error(`失败: ${err.message}`); } finally { setIsAiLoading(false); }
+    } catch (error) {
+      message.error(`失败: ${error instanceof Error ? error.message : '未知错误'}`);
+    } finally {
+      setIsAiLoading(false);
+    }
   };
 
   const handleFileUpload = async (fileList: File[]) => {
-    const newFiles = await Promise.all(fileList.map(async (f) => {
-      const path = (f as any).webkitRelativePath || (f as any).path || '';
+    const newFiles = await Promise.all(fileList.map(async file => {
+      const path = (file as any).webkitRelativePath || (file as any).path || '';
       const parts = path.split('/');
-      const group = parts.length >= 2 ? parts[parts.length - 2] : f.name.replace('.csv','');
-      return { name: path || f.name, path, content: await f.text(), groupName: group };
+      const groupName = parts.length >= 2 ? parts[parts.length - 2] : file.name.replace('.csv', '');
+      return {
+        name: path || file.name,
+        path,
+        content: await file.text(),
+        groupName
+      };
     }));
-    setRawFiles(prev => _.uniqBy([...prev, ...newFiles], 'name'));
+
+    setRawFiles(previous => _.uniqBy([...previous, ...newFiles], 'name'));
+    setDataSourceMode('csv');
+    message.success(`已导入 ${newFiles.length} 个 CSV 文件`);
   };
 
-  const trendOption = useMemo(() => {
-    if (!filteredStats) return {};
-    const series = filteredStats.activeGroups.map(group => ({
-      name: group, type: 'bar', stack: 'total', emphasis: { focus: 'series' },
-      data: filteredStats.groupMonthlyTrends[group]?.map(t => t[metric]) || []
-    }));
-    series.push({ name: '总Commit数', type: 'line', yAxisIndex: 1, data: filteredStats.monthlyTrends.map(t => t.commits) } as any);
-    return {
-      tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
-      legend: { bottom: 0 },
-      xAxis: { type: 'category', data: filteredStats.allMonths },
-      yAxis: [{ type: 'value', name: metricLabels[metric].label }, { type: 'value', name: '提交数', position: 'right' }],
-      series
-    };
-  }, [filteredStats, metric]);
+  const pollRunUntilFinished = async (projectId: number, branchId: number, runId: number) => {
+    message.loading({ key: 'analysis-run', content: '正在执行分析任务...' });
+    for (let attempt = 0; attempt < 90; attempt += 1) {
+      const run = await getRun(runId);
+      setActiveRun(run);
+      if (run.status === 'succeeded') {
+        await refreshProjects(projectId, branchId);
+        await loadLatestResult(projectId, branchId, false);
+        message.success({ key: 'analysis-run', content: '分析完成，结果已加载' });
+        return;
+      }
+      if (run.status === 'failed' || run.status === 'canceled') {
+        throw new Error(run.error_message || `任务状态: ${run.status}`);
+      }
+      await sleep(1500);
+    }
+    throw new Error('分析任务超时，请稍后手动刷新');
+  };
+
+  const handleCreateProject = async () => {
+    if (!newGitUrl.trim()) {
+      message.warning('请先输入 Git 地址');
+      return;
+    }
+    setServiceBusy(true);
+    try {
+      const created = await createProject({
+        name: newProjectName.trim() || undefined,
+        git_url: newGitUrl.trim(),
+        default_branch: newDefaultBranch.trim() || 'main'
+      });
+      setNewProjectName('');
+      setNewGitUrl('');
+      setNewDefaultBranch('main');
+      setDataSourceMode('service');
+      await refreshProjects(created.id, created.default_branch_record.id);
+      const run = await triggerBranchUpdate(created.id, created.default_branch_record.id, false);
+      await pollRunUntilFinished(created.id, created.default_branch_record.id, run.run_id);
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '创建项目失败');
+    } finally {
+      setServiceBusy(false);
+    }
+  };
+
+  const handleCreateBranch = async () => {
+    if (!selectedProjectId) {
+      message.warning('请先选择项目');
+      return;
+    }
+    if (!newBranchName.trim()) {
+      message.warning('请输入分支名称');
+      return;
+    }
+    setServiceBusy(true);
+    try {
+      const branch = await createBranch(selectedProjectId, {
+        branch_name: newBranchName.trim(),
+        is_default: false,
+        analyzer_config: { max_lines: 2000 }
+      });
+      setNewBranchName('');
+      await loadProjectContext(selectedProjectId, branch.id, false);
+      setSelectedBranchId(branch.id);
+      setDataSourceMode('service');
+      message.success('分支已添加，请点击“更新分析”生成结果');
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '新增分支失败');
+    } finally {
+      setServiceBusy(false);
+    }
+  };
+
+  const handleProjectChange = async (projectId: number) => {
+    setSelectedProjectId(projectId);
+    setDataSourceMode('service');
+    setServiceBusy(true);
+    try {
+      await loadProjectContext(projectId);
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '加载项目失败');
+    } finally {
+      setServiceBusy(false);
+    }
+  };
+
+  const handleBranchChange = async (branchId: number) => {
+    if (!selectedProjectId) {
+      return;
+    }
+    setSelectedBranchId(branchId);
+    setDataSourceMode('service');
+    setServiceBusy(true);
+    try {
+      await loadLatestResult(selectedProjectId, branchId, false);
+    } finally {
+      setServiceBusy(false);
+    }
+  };
+
+  const handleAnalyzeSelectedBranch = async (force: boolean) => {
+    if (!selectedProjectId || !selectedBranchId) {
+      message.warning('请先选择项目和分支');
+      return;
+    }
+    setDataSourceMode('service');
+    setServiceBusy(true);
+    try {
+      const run = await triggerBranchUpdate(selectedProjectId, selectedBranchId, force);
+      await pollRunUntilFinished(selectedProjectId, selectedBranchId, run.run_id);
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '分析任务失败');
+    } finally {
+      setServiceBusy(false);
+    }
+  };
+
+  const handleDeleteSelectedProject = async () => {
+    if (!selectedProjectId) {
+      return;
+    }
+    if (!window.confirm(`确认彻底删除项目 ${selectedProject?.name || ''} 吗？这会删除本地缓存和分析结果。`)) {
+      return;
+    }
+    setServiceBusy(true);
+    try {
+      await deleteProject(selectedProjectId);
+      setRemoteStats(null);
+      setActiveRun(null);
+      await refreshProjects();
+      message.success('项目已删除');
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '删除项目失败');
+    } finally {
+      setServiceBusy(false);
+    }
+  };
+
+  const handleClearSelectedProjectCache = async () => {
+    if (!selectedProjectId) {
+      return;
+    }
+    setServiceBusy(true);
+    try {
+      await clearProjectCache(selectedProjectId);
+      setCacheInfo(await getProjectCache(selectedProjectId));
+      message.success('本地缓存已清理');
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '清理缓存失败');
+    } finally {
+      setServiceBusy(false);
+    }
+  };
+
+  const sourceDescription = useMemo(() => {
+    if (dataSourceMode === 'service') {
+      if (remoteStats?.projectMeta?.name && remoteStats?.branchMeta?.name) {
+        return `服务结果 · ${remoteStats.projectMeta.name} / ${remoteStats.branchMeta.name}`;
+      }
+      return '服务结果';
+    }
+    if (rawFiles.length > 0) {
+      return `CSV 导入 · ${rawFiles.length} 个文件`;
+    }
+    return 'CSV 模式';
+  }, [dataSourceMode, rawFiles.length, remoteStats]);
 
   return (
     <Layout style={{ minHeight: '100vh', padding: '24px', background: '#f5f7f9' }}>
-      <Header style={{ background: 'transparent', padding: 0, marginBottom: 24, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-        <Title level={2} style={{ margin: 0 }}>研发效能深度分析看板</Title>
-        <Space size="large">
+      <Header style={{ background: 'transparent', padding: 0, marginBottom: 24, display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 16 }}>
+        <Space direction="vertical" size={2}>
+          <Title level={2} style={{ margin: 0 }}>研发效能深度分析看板</Title>
+          <Space wrap>
+            <Tag color="blue">{sourceDescription}</Tag>
+            {remoteStats?.runMeta?.commitSha ? <Tag color="geekblue">Commit {remoteStats.runMeta.commitSha.slice(0, 8)}</Tag> : null}
+            {activeRun ? <Tag color={runStatusColors[activeRun.status] || 'default'}>任务状态: {activeRun.status}</Tag> : null}
+          </Space>
+        </Space>
+        <Space size="large" wrap>
+          <Segmented<DataSourceMode>
+            value={dataSourceMode}
+            onChange={value => setDataSourceMode(value)}
+            options={[
+              { label: '服务模式', value: 'service', disabled: serviceAvailable === false },
+              { label: 'CSV 模式', value: 'csv' }
+            ]}
+          />
           <Space>
             <Text strong><FilterOutlined /> 统计工程：</Text>
-            <Checkbox 
+            <Checkbox
               indeterminate={selectedGroups.length > 0 && selectedGroups.length < (baseStats?.allGroups.length || 0)}
               checked={selectedGroups.length === (baseStats?.allGroups.length || 0) && (baseStats?.allGroups.length || 0) > 0}
-              onChange={e => setSelectedGroups(e.target.checked ? (baseStats?.allGroups || []) : [])}
-            >全选</Checkbox>
-            <Select mode="multiple" style={{ minWidth: 200, maxWidth: 400 }} value={selectedGroups} onChange={setSelectedGroups} maxTagCount="responsive">
-              {baseStats?.allGroups.map(g => <Select.Option key={g} value={g}>{g}</Select.Option>)}
-            </Select>
+              onChange={event => setSelectedGroups(event.target.checked ? (baseStats?.allGroups || []) : [])}
+              disabled={!baseStats}
+            >
+              全选
+            </Checkbox>
+            <Select
+              mode="multiple"
+              style={{ minWidth: 220, maxWidth: 420 }}
+              value={selectedGroups}
+              onChange={setSelectedGroups}
+              maxTagCount="responsive"
+              disabled={!baseStats}
+              options={(baseStats?.allGroups || []).map(group => ({ label: group, value: group }))}
+            />
           </Space>
           <Space>
             <Text strong>指标：</Text>
@@ -338,23 +814,157 @@ const App: React.FC = () => {
 
       <Content>
         <Space direction="vertical" size="large" style={{ width: '100%' }}>
+          <Card title={<span><ApiOutlined /> Git 服务模式</span>} extra={<Button icon={<ReloadOutlined />} onClick={() => bootstrapService().catch(() => undefined)} loading={serviceBusy}>刷新服务</Button>}>
+            <Alert
+              type={serviceAvailable === false ? 'error' : serviceAvailable ? 'success' : 'info'}
+              message={serviceAvailable === false ? '后端服务不可用' : serviceAvailable ? '后端服务可用' : '正在检查后端服务'}
+              description={serviceHint}
+              showIcon
+              style={{ marginBottom: 16 }}
+            />
+
+            <Row gutter={16}>
+              <Col span={12}>
+                <Card title="新增 Git 项目并立即分析" size="small" bordered={false}>
+                  <Space direction="vertical" style={{ width: '100%' }}>
+                    <Input placeholder="项目名称（可选）" value={newProjectName} onChange={event => setNewProjectName(event.target.value)} />
+                    <Input placeholder="Git 地址，例如 /tmp/demo-repo 或 https://..." value={newGitUrl} onChange={event => setNewGitUrl(event.target.value)} />
+                    <Input placeholder="默认分支" value={newDefaultBranch} onChange={event => setNewDefaultBranch(event.target.value)} />
+                    <Button type="primary" loading={serviceBusy} onClick={handleCreateProject} disabled={serviceAvailable !== true}>
+                      创建项目并开始分析
+                    </Button>
+                  </Space>
+                </Card>
+              </Col>
+              <Col span={12}>
+                <Card title="项目与分支管理" size="small" bordered={false}>
+                  <Space direction="vertical" style={{ width: '100%' }}>
+                    <Select
+                      placeholder="选择项目"
+                      value={selectedProjectId}
+                      onChange={handleProjectChange}
+                      options={projects.map(project => ({
+                        label: `${project.name} (${project.default_branch})`,
+                        value: project.id
+                      }))}
+                      disabled={serviceAvailable !== true || projects.length === 0}
+                    />
+                    <Select
+                      placeholder="选择分支"
+                      value={selectedBranchId}
+                      onChange={handleBranchChange}
+                      options={branches.map(branch => ({
+                        label: branch.is_default ? `${branch.branch_name} (默认)` : branch.branch_name,
+                        value: branch.id
+                      }))}
+                      disabled={!selectedProjectId || branches.length === 0}
+                    />
+                    <Space.Compact style={{ width: '100%' }}>
+                      <Input placeholder="新增分支，例如 release/1.0" value={newBranchName} onChange={event => setNewBranchName(event.target.value)} />
+                      <Button onClick={handleCreateBranch} disabled={!selectedProjectId || serviceAvailable !== true}>新增分支</Button>
+                    </Space.Compact>
+                    <Space wrap>
+                      <Button type="primary" loading={serviceBusy} onClick={() => handleAnalyzeSelectedBranch(false)} disabled={!selectedProjectId || !selectedBranchId || serviceAvailable !== true}>
+                        更新分析
+                      </Button>
+                      <Button loading={serviceBusy} onClick={() => handleAnalyzeSelectedBranch(true)} disabled={!selectedProjectId || !selectedBranchId || serviceAvailable !== true}>
+                        强制重算
+                      </Button>
+                      <Button onClick={() => {
+                        if (selectedProjectId && selectedBranchId) {
+                          loadLatestResult(selectedProjectId, selectedBranchId).catch(error => {
+                            message.error(error instanceof Error ? error.message : '加载结果失败');
+                          });
+                        }
+                      }} disabled={!selectedProjectId || !selectedBranchId}>
+                        加载最新结果
+                      </Button>
+                      <Button onClick={handleClearSelectedProjectCache} disabled={!selectedProjectId || serviceAvailable !== true}>
+                        清理缓存
+                      </Button>
+                      <Button danger onClick={handleDeleteSelectedProject} disabled={!selectedProjectId || serviceAvailable !== true}>
+                        删除项目
+                      </Button>
+                    </Space>
+                  </Space>
+                </Card>
+              </Col>
+            </Row>
+
+            <Space wrap style={{ marginTop: 16 }}>
+              {selectedProject ? <Tag color="blue">项目: {selectedProject.name}</Tag> : null}
+              {selectedBranch ? <Tag color="cyan">分支: {selectedBranch.branch_name}</Tag> : null}
+              {selectedBranch?.last_commit_sha ? <Tag color="geekblue">最近 Commit: {selectedBranch.last_commit_sha.slice(0, 8)}</Tag> : null}
+              {selectedBranch?.last_analyzed_at ? <Tag color="purple">最近分析: {formatTime(selectedBranch.last_analyzed_at)}</Tag> : null}
+              {cacheInfo ? <Tag color={cacheInfo.exists ? 'green' : 'default'}>缓存: {cacheInfo.exists ? formatBytes(cacheInfo.size_bytes) : '未生成'}</Tag> : null}
+              {cacheInfo?.last_fetched_at ? <Tag color="gold">最近 fetch: {formatTime(cacheInfo.last_fetched_at)}</Tag> : null}
+            </Space>
+          </Card>
+
           <Row gutter={16}>
             <Col span={10}>
-              <Dragger multiple directory accept=".csv" beforeUpload={(f, list) => { if (list.indexOf(f) === 0) handleFileUpload(list); return false; }} showUploadList={false} style={{ height: '150px' }}>
-                <p className="ant-upload-drag-icon"><InboxOutlined /></p>
-                <p className="ant-upload-text">点击或拖拽 <b>文件 / 文件夹</b></p>
-              </Dragger>
+              <Card title="CSV 兼容模式" extra={<Button onClick={() => setDataSourceMode('csv')} disabled={!localStats}>切换到 CSV</Button>}>
+                <Dragger
+                  multiple
+                  directory
+                  accept=".csv"
+                  beforeUpload={(file, fileList) => {
+                    if (fileList.indexOf(file) === 0) {
+                      handleFileUpload(fileList);
+                    }
+                    return false;
+                  }}
+                  showUploadList={false}
+                  style={{ height: '150px' }}
+                >
+                  <p className="ant-upload-drag-icon"><InboxOutlined /></p>
+                  <p className="ant-upload-text">点击或拖拽 <b>CSV 文件 / 文件夹</b></p>
+                </Dragger>
+              </Card>
             </Col>
             <Col span={14}>
-              <Card title={<span><SettingOutlined /> 工程归类管理</span>} size="small" style={{ height: '150px', overflowY: 'auto' }}>
-                <List size="small" dataSource={rawFiles} renderItem={file => (
-                  <List.Item actions={[<Button type="link" danger icon={<DeleteOutlined />} onClick={() => setRawFiles(prev => prev.filter(f => f.name !== file.name))} />]}>
-                    <Space><Text code>{file.name}</Text><Input size="small" value={file.groupName} onChange={e => setRawFiles(prev => prev.map(f => f.name === file.name ? { ...f, groupName: e.target.value } : f))} style={{ width: 140 }} /></Space>
-                  </List.Item>
-                )} />
+              <Card title={<span><SettingOutlined /> CSV 工程归类管理</span>} size="small" style={{ height: '214px', overflowY: 'auto' }}>
+                <List
+                  size="small"
+                  dataSource={rawFiles}
+                  locale={{ emptyText: '暂无 CSV 文件' }}
+                  renderItem={file => (
+                    <List.Item
+                      actions={[
+                        <Button
+                          key={`delete-${file.name}`}
+                          type="link"
+                          danger
+                          icon={<DeleteOutlined />}
+                          onClick={() => setRawFiles(previous => previous.filter(item => item.name !== file.name))}
+                        />
+                      ]}
+                    >
+                      <Space>
+                        <Text code>{file.name}</Text>
+                        <Input
+                          size="small"
+                          value={file.groupName}
+                          onChange={event => setRawFiles(previous => previous.map(item => (
+                            item.name === file.name ? { ...item, groupName: event.target.value } : item
+                          )))}
+                          style={{ width: 160 }}
+                        />
+                      </Space>
+                    </List.Item>
+                  )}
+                />
               </Card>
             </Col>
           </Row>
+
+          {serviceBusy && dataSourceMode === 'service' ? (
+            <Card>
+              <div style={{ textAlign: 'center', padding: '32px 0' }}>
+                <Spin tip="服务处理中，请稍候..." />
+              </div>
+            </Card>
+          ) : null}
 
           {filteredStats ? (
             <>
@@ -365,147 +975,309 @@ const App: React.FC = () => {
                 <Col span={6}><Card><Statistic title="总提交" value={filteredStats.totalCommits} /></Card></Col>
               </Row>
 
-              <Card title={`月度趋势对比 (${metricLabels[metric].label})`}><ReactECharts option={trendOption} style={{ height: 380 }} notMerge={true} /></Card>
+              <Card title={`月度趋势对比 (${metricLabels[metric].label})`}>
+                <ReactECharts option={trendOption} style={{ height: 380 }} notMerge />
+              </Card>
 
               <Tabs type="card" items={[
-                { key: '1', label: '工程维度', children: (
-                  <Card bordered={false}>
-                    <Table dataSource={filteredStats.groupStats} size="small" columns={[
-                      { title: '顶级工程', dataIndex: 'group' },
-                      { title: '包含模块', dataIndex: 'projectCount' },
-                      { title: '参与人数', dataIndex: 'authorCount' },
-                      { title: `总${metricLabels[metric].label}`, dataIndex: metric, render: v => <Text strong style={{ color: metricLabels[metric].color }}>{v}</Text> }
-                    ]} pagination={false} />
-                    <Table dataSource={filteredStats.projectStats} pagination={{ pageSize: 5 }} size="small" style={{ marginTop: 16 }} columns={[
-                      { title: '所属工程', dataIndex: 'group' },
-                      { title: '子模块', dataIndex: 'project' },
-                      { title: metricLabels[metric].label, dataIndex: metric }
-                    ]} />
-                  </Card>
-                )},
-                { key: '2', label: '人员排名', children: (
-                  <Card bordered={false}>
-                    <Space style={{ marginBottom: 16 }}><Text strong>显示排名人数：</Text>
-                      <Select value={topN} onChange={setTopN} style={{ width: 120 }} options={[{ label: 'Top 10', value: 10 }, { label: 'Top 20', value: 20 }, { label: 'Top 50', value: 50 }, { label: '全部', value: authorRanking.length }]} />
-                    </Space>
-                    <ReactECharts option={authorRankingChartOption} style={{ height: Math.max(350, Math.min(topN, authorRanking.length) * 30), marginBottom: 24 }} notMerge={true} />
-                    <Table dataSource={authorRanking} size="small" columns={[
-                      { title: '排名', render: (_1, _2, index) => index + 1, width: 60 },
-                      { title: '作者', dataIndex: 'author' },
-                      { title: `${metricLabels[metric].label}(选中范围)`, dataIndex: metric, render: v => <Text strong style={{ color: metricLabels[metric].color }}>{v}</Text> },
-                      { title: '提交(选中范围)', dataIndex: 'commits' }
-                    ]} />
-                  </Card>
-                )},
-                { key: '3', label: '交叉明细', children: (
-                  <Card bordered={false}>
-                    <Table dataSource={filteredStats.authorProjectStats} size="small" columns={[
-                      { title: '工程', dataIndex: 'group', filters: _.uniq(filteredStats.authorProjectStats.map(s => s.group)).map(g => ({ text: g, value: g })), onFilter: (v, r) => r.group === v },
-                      { title: '模块', dataIndex: 'project', filterSearch: true, filters: _.uniq(filteredStats.authorProjectStats.map(s => s.project)).map(p => ({ text: p, value: p })), onFilter: (v, r) => r.project === v },
-                      { title: '作者', dataIndex: 'author', filterSearch: true, filters: _.uniq(filteredStats.authorProjectStats.map(s => s.author)).map(a => ({ text: a, value: a })), onFilter: (v, r) => r.author === v },
-                      { title: metricLabels[metric].label, dataIndex: metric, sorter: (a: any, b: any) => a[metric] - b[metric], defaultSortOrder: 'descend' }
-                    ]} />
-                  </Card>
-                )},
-                { key: '4', label: '个人明细', children: (
-                  <Card bordered={false}>
-                    <Space style={{ marginBottom: 16 }}><Text strong>选择要查看的人员：</Text>
-                      <Select showSearch value={selectedAuthor} onChange={setSelectedAuthor} style={{ width: 250 }} options={allAuthors.map(a => ({ label: String(a), value: String(a) }))} />
-                    </Space>
-                    <ReactECharts option={authorChartOption} style={{ height: 300, marginBottom: 24 }} notMerge={true} />
-                    <Table dataSource={authorTableData} size="small" columns={[
-                      { title: '月份', dataIndex: 'month', sorter: (a: any, b: any) => a.month.localeCompare(b.month), defaultSortOrder: 'descend' },
-                      { title: '工程', dataIndex: 'group' }, { title: '模块', dataIndex: 'project' },
-                      { title: metricLabels[metric].label, dataIndex: metric }, { title: '提交数', dataIndex: 'commits' }
-                    ]} />
-                  </Card>
-                )},
-                { key: '5', label: '月度对比', children: (
-                  <Card bordered={false}>
-                    <Space style={{ marginBottom: 16, flexWrap: 'wrap' }}>
-                      <Space><Text strong>对比人员：</Text><Select mode="multiple" showSearch allowClear value={monthlySelectedAuthors} onChange={setMonthlySelectedAuthors} style={{ minWidth: 200, maxWidth: 400 }} options={allAuthors.map(a => ({ label: String(a), value: String(a) }))} /></Space>
-                      <Space style={{ marginLeft: 16 }}><Text strong>对比月份：</Text><Select mode="multiple" showSearch allowClear value={monthlySelectedMonths} onChange={setMonthlySelectedMonths} style={{ minWidth: 200, maxWidth: 400 }} options={filteredStats?.allMonths.map(m => ({ label: m, value: m }))} /></Space>
-                    </Space>
-                    <ReactECharts option={monthlyAnalysisChartOption} style={{ height: Math.max(350, (monthlySelectedAuthors.length || 15) * 35), marginBottom: 24 }} notMerge={true} />
-                    <Table dataSource={monthlyAnalysisPivot} size="small" scroll={{ x: 'max-content' }} columns={[
-                      { title: '作者', dataIndex: 'author', fixed: 'left' },
-                      ...targetMonthsForAnalysis.map(month => ({ title: month, dataIndex: month, render: (v: any) => v || '-', sorter: (a: any, b: any) => (a[month] || 0) - (b[month] || 0) })),
-                      { title: `总计 (${metricLabels[metric].label})`, dataIndex: 'total', fixed: 'right', render: v => <Text strong style={{ color: metricLabels[metric].color }}>{v}</Text>, sorter: (a: any, b: any) => a.total - b.total, defaultSortOrder: 'descend' }
-                    ]} />
-                  </Card>
-                )},
-                { key: '6', label: 'AI分析', children: (
-                  <Card bordered={false}>
-                    <Row gutter={24}>
-                      <Col span={8}>
-                        <Card title="AI 配置与范围" size="small">
-                          <Space direction="vertical" style={{ width: '100%' }}>
-                            <Text strong>1. 基础配置</Text>
-                            <Input.Password placeholder="API Key" value={aiApiKey} onChange={e => setAiApiKey(e.target.value)} />
-                            <Input placeholder="API Endpoint" value={aiApiUrl} onChange={e => setAiApiUrl(e.target.value)} />
-                            <Input placeholder="模型名称" value={aiModel} onChange={e => setAiApiModel(e.target.value)} />
-                            <Button block size="small" onClick={() => { localStorage.setItem('ai_api_key', aiApiKey); localStorage.setItem('ai_api_url', aiApiUrl); localStorage.setItem('ai_model', aiModel); message.success('已保存'); }}>保存配置</Button>
-                            
-                            <Text strong style={{ marginTop: 12, display: 'block' }}>2. 分析范围</Text>
-                            <Select 
-                              style={{ width: '100%' }} 
-                              value={aiAnalysisMode} 
-                              onChange={(val) => { setAiAnalysisMode(val); setAiTargetItems([]); }}
-                              options={[
-                                { label: '全工程概览', value: 'overview' },
-                                { label: '特定工程深度分析', value: 'project' },
-                                { label: '特定人员效能评估', value: 'author' }
-                              ]}
-                            />
-                            
-                            {aiAnalysisMode !== 'overview' && (
+                {
+                  key: '1',
+                  label: '工程维度',
+                  children: (
+                    <Card bordered={false}>
+                      <Table
+                        dataSource={filteredStats.groupStats}
+                        size="small"
+                        pagination={false}
+                        rowKey={(record: any) => record.group}
+                        columns={[
+                          { title: '顶级工程', dataIndex: 'group' },
+                          { title: '包含模块', dataIndex: 'projectCount' },
+                          { title: '参与人数', dataIndex: 'authorCount' },
+                          { title: `总${metricLabels[metric].label}`, dataIndex: metric, render: value => <Text strong style={{ color: metricLabels[metric].color }}>{value}</Text> }
+                        ]}
+                      />
+                      <Table
+                        dataSource={filteredStats.projectStats}
+                        pagination={{ pageSize: 5 }}
+                        size="small"
+                        rowKey={(record: any) => record.key}
+                        style={{ marginTop: 16 }}
+                        columns={[
+                          { title: '所属工程', dataIndex: 'group' },
+                          { title: '子模块', dataIndex: 'project' },
+                          { title: metricLabels[metric].label, dataIndex: metric }
+                        ]}
+                      />
+                    </Card>
+                  )
+                },
+                {
+                  key: '2',
+                  label: '人员排名',
+                  children: (
+                    <Card bordered={false}>
+                      <Space style={{ marginBottom: 16 }}>
+                        <Text strong>显示排名人数：</Text>
+                        <Select
+                          value={topN}
+                          onChange={setTopN}
+                          style={{ width: 120 }}
+                          options={[
+                            { label: 'Top 10', value: 10 },
+                            { label: 'Top 20', value: 20 },
+                            { label: 'Top 50', value: 50 },
+                            { label: '全部', value: authorRanking.length || 10 }
+                          ]}
+                        />
+                      </Space>
+                      <ReactECharts option={authorRankingChartOption} style={{ height: Math.max(350, Math.min(topN, Math.max(authorRanking.length, 1)) * 30), marginBottom: 24 }} notMerge />
+                      <Table
+                        dataSource={authorRanking}
+                        size="small"
+                        rowKey={(record: any) => record.author}
+                        columns={[
+                          { title: '排名', render: (_, __, index) => index + 1, width: 60 },
+                          { title: '作者', dataIndex: 'author' },
+                          { title: `${metricLabels[metric].label}(选中范围)`, dataIndex: metric, render: value => <Text strong style={{ color: metricLabels[metric].color }}>{value}</Text> },
+                          { title: '提交(选中范围)', dataIndex: 'commits' }
+                        ]}
+                      />
+                    </Card>
+                  )
+                },
+                {
+                  key: '3',
+                  label: '交叉明细',
+                  children: (
+                    <Card bordered={false}>
+                      <Table
+                        dataSource={filteredStats.authorProjectStats}
+                        size="small"
+                        rowKey={(record: any) => record.key}
+                        columns={[
+                          {
+                            title: '工程',
+                            dataIndex: 'group',
+                            filters: _.uniq(filteredStats.authorProjectStats.map(item => item.group)).map(group => ({ text: group, value: group })),
+                            onFilter: (value, record: any) => record.group === value
+                          },
+                          {
+                            title: '模块',
+                            dataIndex: 'project',
+                            filterSearch: true,
+                            filters: _.uniq(filteredStats.authorProjectStats.map(item => item.project)).map(project => ({ text: project, value: project })),
+                            onFilter: (value, record: any) => record.project === value
+                          },
+                          {
+                            title: '作者',
+                            dataIndex: 'author',
+                            filterSearch: true,
+                            filters: _.uniq(filteredStats.authorProjectStats.map(item => item.author)).map(author => ({ text: author, value: author })),
+                            onFilter: (value, record: any) => record.author === value
+                          },
+                          {
+                            title: metricLabels[metric].label,
+                            dataIndex: metric,
+                            sorter: (a: any, b: any) => a[metric] - b[metric],
+                            defaultSortOrder: 'descend'
+                          }
+                        ]}
+                      />
+                    </Card>
+                  )
+                },
+                {
+                  key: '4',
+                  label: '个人明细',
+                  children: (
+                    <Card bordered={false}>
+                      <Space style={{ marginBottom: 16 }}>
+                        <Text strong>选择要查看的人员：</Text>
+                        <Select
+                          showSearch
+                          value={selectedAuthor}
+                          onChange={setSelectedAuthor}
+                          style={{ width: 250 }}
+                          options={allAuthors.map(author => ({ label: String(author), value: String(author) }))}
+                        />
+                      </Space>
+                      <ReactECharts option={authorChartOption} style={{ height: 300, marginBottom: 24 }} notMerge />
+                      <Table
+                        dataSource={authorTableData}
+                        size="small"
+                        rowKey={(record: any) => record.key}
+                        columns={[
+                          { title: '月份', dataIndex: 'month', sorter: (a: any, b: any) => a.month.localeCompare(b.month), defaultSortOrder: 'descend' },
+                          { title: '工程', dataIndex: 'group' },
+                          { title: '模块', dataIndex: 'project' },
+                          { title: metricLabels[metric].label, dataIndex: metric },
+                          { title: '提交数', dataIndex: 'commits' }
+                        ]}
+                      />
+                    </Card>
+                  )
+                },
+                {
+                  key: '5',
+                  label: '月度对比',
+                  children: (
+                    <Card bordered={false}>
+                      <Space style={{ marginBottom: 16, flexWrap: 'wrap' }}>
+                        <Space>
+                          <Text strong>对比人员：</Text>
+                          <Select
+                            mode="multiple"
+                            showSearch
+                            allowClear
+                            value={monthlySelectedAuthors}
+                            onChange={setMonthlySelectedAuthors}
+                            style={{ minWidth: 220, maxWidth: 420 }}
+                            options={allAuthors.map(author => ({ label: String(author), value: String(author) }))}
+                          />
+                        </Space>
+                        <Space style={{ marginLeft: 16 }}>
+                          <Text strong>对比月份：</Text>
+                          <Select
+                            mode="multiple"
+                            showSearch
+                            allowClear
+                            value={monthlySelectedMonths}
+                            onChange={setMonthlySelectedMonths}
+                            style={{ minWidth: 220, maxWidth: 420 }}
+                            options={filteredStats.allMonths.map(month => ({ label: month, value: month }))}
+                          />
+                        </Space>
+                      </Space>
+                      <ReactECharts option={monthlyAnalysisChartOption} style={{ height: Math.max(350, (monthlySelectedAuthors.length || 15) * 35), marginBottom: 24 }} notMerge />
+                      <Table
+                        dataSource={monthlyAnalysisPivot}
+                        size="small"
+                        rowKey={(record: any) => String(record.key)}
+                        scroll={{ x: 'max-content' }}
+                        columns={[
+                          { title: '作者', dataIndex: 'author', fixed: 'left' },
+                          ...targetMonthsForAnalysis.map(month => ({
+                            title: month,
+                            dataIndex: month,
+                            render: (value: any) => value || '-',
+                            sorter: (a: any, b: any) => Number(a[month] || 0) - Number(b[month] || 0)
+                          })),
+                          {
+                            title: `总计 (${metricLabels[metric].label})`,
+                            dataIndex: 'total',
+                            fixed: 'right',
+                            render: value => <Text strong style={{ color: metricLabels[metric].color }}>{value}</Text>,
+                            sorter: (a: any, b: any) => Number(a.total) - Number(b.total),
+                            defaultSortOrder: 'descend'
+                          }
+                        ]}
+                      />
+                    </Card>
+                  )
+                },
+                {
+                  key: '6',
+                  label: 'AI分析',
+                  children: (
+                    <Card bordered={false}>
+                      <Row gutter={24}>
+                        <Col span={8}>
+                          <Card title="AI 配置与范围" size="small">
+                            <Space direction="vertical" style={{ width: '100%' }}>
+                              <Text strong>1. 基础配置</Text>
+                              <Input.Password placeholder="API Key" value={aiApiKey} onChange={event => setAiApiKey(event.target.value)} />
+                              <Input placeholder="API Endpoint" value={aiApiUrl} onChange={event => setAiApiUrl(event.target.value)} />
+                              <Input placeholder="模型名称" value={aiModel} onChange={event => setAiApiModel(event.target.value)} />
+                              <Button
+                                block
+                                size="small"
+                                onClick={() => {
+                                  localStorage.setItem('ai_api_key', aiApiKey);
+                                  localStorage.setItem('ai_api_url', aiApiUrl);
+                                  localStorage.setItem('ai_model', aiModel);
+                                  message.success('已保存');
+                                }}
+                              >
+                                保存配置
+                              </Button>
+
+                              <Text strong style={{ marginTop: 12, display: 'block' }}>2. 分析范围</Text>
                               <Select
-                                mode="multiple"
                                 style={{ width: '100%' }}
-                                placeholder={aiAnalysisMode === 'project' ? "选择要分析的工程" : "选择要分析的人员"}
-                                value={aiTargetItems}
-                                onChange={setAiTargetItems}
-                                options={aiAnalysisMode === 'project' ? 
-                                  filteredStats.activeGroups.map(g => ({ label: g, value: g })) : 
-                                  allAuthors.map(a => ({ label: String(a), value: String(a) }))
-                                }
+                                value={aiAnalysisMode}
+                                onChange={value => {
+                                  setAiAnalysisMode(value);
+                                  setAiTargetItems([]);
+                                }}
+                                options={[
+                                  { label: '全工程概览', value: 'overview' },
+                                  { label: '特定工程深度分析', value: 'project' },
+                                  { label: '特定人员效能评估', value: 'author' }
+                                ]}
                               />
+
+                              {aiAnalysisMode !== 'overview' ? (
+                                <Select
+                                  mode="multiple"
+                                  style={{ width: '100%' }}
+                                  placeholder={aiAnalysisMode === 'project' ? '选择要分析的工程' : '选择要分析的人员'}
+                                  value={aiTargetItems}
+                                  onChange={setAiTargetItems}
+                                  options={aiAnalysisMode === 'project'
+                                    ? filteredStats.activeGroups.map(group => ({ label: group, value: group }))
+                                    : allAuthors.map(author => ({ label: String(author), value: String(author) }))}
+                                />
+                              ) : null}
+
+                              <Text strong style={{ marginTop: 12, display: 'block' }}>3. 自定义关注焦点 (可选)</Text>
+                              <Input.TextArea
+                                rows={3}
+                                placeholder="例如：分析2月产出下滑原因、评价核心人员稳定性等"
+                                value={aiCustomFocus}
+                                onChange={event => setAiCustomFocus(event.target.value)}
+                              />
+
+                              <Button block type="primary" icon={<RobotOutlined />} loading={isAiLoading} onClick={handleAiAnalysis} style={{ marginTop: 16 }}>
+                                开始智能分析
+                              </Button>
+                            </Space>
+                          </Card>
+                        </Col>
+                        <Col span={16}>
+                          <Card title="AI 分析报告" size="small" style={{ minHeight: '500px' }}>
+                            {isAiLoading ? (
+                              <div style={{ textAlign: 'center', marginTop: 150 }}>
+                                <Spin size="large" tip="AI 正在深度思考中..." />
+                              </div>
+                            ) : aiAnalysis ? (
+                              <div style={{ padding: '0 16px' }}>
+                                <ReactMarkdown>{aiAnalysis}</ReactMarkdown>
+                              </div>
+                            ) : (
+                              <div style={{ textAlign: 'center', marginTop: 150 }}>
+                                <Text type="secondary">配置参数并点击左侧按钮开始分析</Text>
+                              </div>
                             )}
-
-                            <Text strong style={{ marginTop: 12, display: 'block' }}>3. 自定义关注焦点 (可选)</Text>
-                            <Input.TextArea 
-                              rows={3} 
-                              placeholder="例如：分析2月产出下滑原因、评价核心人员稳定性等" 
-                              value={aiCustomFocus}
-                              onChange={e => setAiCustomFocus(e.target.value)}
-                            />
-
-                            <Button 
-                              block 
-                              type="primary" 
-                              icon={<RobotOutlined />} 
-                              loading={isAiLoading} 
-                              onClick={handleAiAnalysis} 
-                              style={{ marginTop: 16 }}
-                            >
-                              开始智能分析
-                            </Button>
-                          </Space>
-                        </Card>
-                      </Col>
-                      <Col span={16}>
-                        <Card title="AI 分析报告" size="small" style={{ minHeight: '500px' }}>
-                          {isAiLoading ? <div style={{ textAlign: 'center', marginTop: 150 }}><Spin size="large" tip="AI 正在深度思考中..." /></div> : 
-                           aiAnalysis ? <div style={{ padding: '0 16px' }}><ReactMarkdown>{aiAnalysis}</ReactMarkdown></div> : 
-                           <div style={{ textAlign: 'center', marginTop: 150 }}><Text type="secondary">配置参数并点击左侧按钮开始分析</Text></div>}
-                        </Card>
-                      </Col>
-                    </Row>
-                  </Card>
-                )}
+                          </Card>
+                        </Col>
+                      </Row>
+                    </Card>
+                  )
+                }
               ]} />
             </>
-          ) : <div style={{ textAlign: 'center', padding: '100px', background: '#fff' }}><Text type="secondary">请选择至少一个统计工程</Text></div>}
+          ) : (
+            <Card>
+              <div style={{ textAlign: 'center', padding: '100px 0' }}>
+                <Text type="secondary">
+                  {dataSourceMode === 'service'
+                    ? '请选择项目分支并执行分析，或先创建一个新的 Git 项目。'
+                    : '请上传 CSV 文件，或切换到服务模式从 Git 仓库直接分析。'}
+                </Text>
+              </div>
+            </Card>
+          )}
         </Space>
       </Content>
     </Layout>
