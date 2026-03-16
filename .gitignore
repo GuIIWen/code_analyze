@@ -26,3 +26,6 @@ dist-ssr
 # Data
 hcc_simulate/
 *.csv
+storage/
+__pycache__/
+*.pyc
