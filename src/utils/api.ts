@@ -77,6 +77,20 @@ export interface ProjectCreatePayload {
 
 export interface ProjectCreateResult extends ProjectSummary {
   default_branch_record: BranchSummary;
+  branches: BranchSummary[];
+  added_branches: BranchSummary[];
+}
+
+export interface ProjectSyncResult {
+  project: ProjectSummary;
+  branches: BranchSummary[];
+  added_branches: BranchSummary[];
+  default_branch_record: BranchSummary;
+}
+
+export interface BranchUpdateResult extends ProjectSyncResult {
+  run_id: number;
+  status: string;
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -103,6 +117,9 @@ export const createProject = (payload: ProjectCreatePayload) => request<ProjectC
   method: 'POST',
   body: JSON.stringify(payload)
 });
+export const syncProject = (projectId: number) => request<ProjectSyncResult>(`/projects/${projectId}/sync`, {
+  method: 'POST'
+});
 export const deleteProject = (projectId: number) => request<{ deleted: boolean }>(`/projects/${projectId}?mode=full`, {
   method: 'DELETE'
 });
@@ -126,7 +143,7 @@ export const triggerBranchUpdate = (
   projectId: number,
   branchId: number,
   force = false
-) => request<{ run_id: number; status: string }>(`/projects/${projectId}/branches/${branchId}/update`, {
+) => request<BranchUpdateResult>(`/projects/${projectId}/branches/${branchId}/update`, {
   method: 'POST',
   body: JSON.stringify({ force })
 });

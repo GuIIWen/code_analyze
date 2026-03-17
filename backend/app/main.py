@@ -202,6 +202,32 @@ def sync_project_branches(project: dict, preferred_default_branch: str | None = 
     return branches, default_branch
 
 
+def sync_project_state(project: dict, preferred_default_branch: str | None = None) -> dict:
+    existing_branch_names = {
+        branch["branch_name"] for branch in repository.list_branches(project["id"])
+    }
+    branches, default_branch = sync_project_branches(project, preferred_default_branch)
+    synced_project = repository.get_project(project["id"]) or project
+    added_branches = [
+        branch for branch in branches if branch["branch_name"] not in existing_branch_names
+    ]
+    return {
+        "project": synced_project,
+        "branches": branches,
+        "default_branch": default_branch,
+        "added_branches": added_branches,
+    }
+
+
+def serialize_project_sync(state: dict) -> dict:
+    return {
+        "project": serialize_project(state["project"]),
+        "branches": [serialize_branch(branch) for branch in state["branches"]],
+        "added_branches": [serialize_branch(branch) for branch in state["added_branches"]],
+        "default_branch_record": serialize_branch(state["default_branch"]),
+    }
+
+
 @app.exception_handler(HTTPException)
 async def handle_http_exception(_: Request, exc: HTTPException):
     detail = exc.detail if isinstance(exc.detail, dict) else {"code": "HTTP_ERROR", "message": str(exc.detail)}
@@ -227,7 +253,7 @@ async def create_project(payload: ProjectCreate):
     project: dict | None = None
     try:
         project = repository.create_project(project_name, payload.git_url, payload.default_branch)
-        _, branch = sync_project_branches(project, payload.default_branch)
+        sync_state = sync_project_state(project, payload.default_branch)
     except Exception as exc:
         if project is not None:
             remove_project_storage(settings, project)
@@ -235,8 +261,10 @@ async def create_project(payload: ProjectCreate):
         if "UNIQUE constraint failed: projects.git_url" in str(exc):
             api_error(409, "PROJECT_EXISTS", "project already exists")
         raise
-    data = serialize_project(project)
-    data["default_branch_record"] = serialize_branch(branch)
+    data = serialize_project(sync_state["project"])
+    data["default_branch_record"] = serialize_branch(sync_state["default_branch"])
+    data["branches"] = [serialize_branch(branch) for branch in sync_state["branches"]]
+    data["added_branches"] = [serialize_branch(branch) for branch in sync_state["added_branches"]]
     return success(data)
 
 
@@ -273,6 +301,12 @@ async def update_project(project_id: int, payload: ProjectUpdate):
             repository.update_branch(branch["id"], project_id, is_default=True)
     project = repository.update_project(project_id, **updates)
     return success(serialize_project(project))
+
+
+@app.post("/api/projects/{project_id}/sync")
+async def sync_project(project_id: int):
+    project = get_project_or_404(project_id)
+    return success(serialize_project_sync(sync_project_state(project, project["default_branch"])))
 
 
 @app.delete("/api/projects/{project_id}")
@@ -352,11 +386,15 @@ async def delete_branch(project_id: int, branch_id: int):
 
 @app.post("/api/projects/{project_id}/branches/{branch_id}/update")
 async def update_branch_run(project_id: int, branch_id: int, payload: BranchUpdateRequest):
-    get_project_or_404(project_id)
+    project = get_project_or_404(project_id)
     get_branch_or_404(project_id, branch_id)
+    sync_state = sync_project_state(project, project["default_branch"])
     trigger_type = "manual_reanalyze" if payload.force else "manual_update"
     run = enqueue_run(project_id, branch_id, trigger_type)
-    return success({"run_id": run["id"], "status": run["status"]})
+    data = serialize_project_sync(sync_state)
+    data["run_id"] = run["id"]
+    data["status"] = run["status"]
+    return success(data)
 
 
 @app.post("/api/projects/{project_id}/branches/{branch_id}/reanalyze")

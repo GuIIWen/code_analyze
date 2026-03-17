@@ -38,7 +38,9 @@ import _ from 'lodash';
 import authorMapping from '../author_mapping.json';
 import {
   BranchSummary,
+  BranchUpdateResult,
   ProjectSummary,
+  ProjectSyncResult,
   RunSummary,
   cancelRun,
   clearProjectCache,
@@ -52,6 +54,7 @@ import {
   healthCheck,
   listBranchRuns,
   listProjects,
+  syncProject,
   triggerBranchUpdate
 } from './utils/api';
 import { AggregatedStats, DashboardStats, FileInfo, processCSVFiles } from './utils/dataProcessor';
@@ -181,6 +184,49 @@ const App: React.FC = () => {
     () => branches.find(branch => branch.id === selectedBranchId),
     [branches, selectedBranchId]
   );
+
+  const resolveBranchId = (branchItems: BranchSummary[], preferredBranchId?: number) => {
+    if (branchItems.length === 0) {
+      return undefined;
+    }
+    if (preferredBranchId && branchItems.some(branch => branch.id === preferredBranchId)) {
+      return preferredBranchId;
+    }
+    if (selectedBranchId && branchItems.some(branch => branch.id === selectedBranchId)) {
+      return selectedBranchId;
+    }
+    return branchItems.find(branch => branch.is_default)?.id || branchItems[0].id;
+  };
+
+  const applyProjectSyncState = async (
+    payload: ProjectSyncResult | BranchUpdateResult,
+    preferredBranchId?: number
+  ) => {
+    setProjects(previous => {
+      const exists = previous.some(project => project.id === payload.project.id);
+      if (!exists) {
+        return [payload.project, ...previous];
+      }
+      return previous.map(project => (
+        project.id === payload.project.id ? payload.project : project
+      ));
+    });
+    setSelectedProjectId(payload.project.id);
+    setBranches(payload.branches);
+
+    if (payload.branches.length === 0) {
+      setSelectedBranchId(undefined);
+      setRemoteStats(null);
+      setActiveRun(null);
+      setCacheInfo(await getProjectCache(payload.project.id));
+      return undefined;
+    }
+
+    const branchId = resolveBranchId(payload.branches, preferredBranchId);
+    setSelectedBranchId(branchId);
+    setCacheInfo(await getProjectCache(payload.project.id));
+    return branchId;
+  };
 
   const loadLatestResult = async (projectId: number, branchId: number, notify = true) => {
     try {
@@ -771,9 +817,34 @@ const App: React.FC = () => {
     setServiceBusy(true);
     try {
       const run = await triggerBranchUpdate(selectedProjectId, selectedBranchId, force);
-      await pollRunUntilFinished(selectedProjectId, selectedBranchId, run.run_id);
+      const branchId = await applyProjectSyncState(run, selectedBranchId);
+      if (run.added_branches.length > 0) {
+        message.info(`已同步到 ${run.added_branches.length} 个新分支`);
+      }
+      await pollRunUntilFinished(selectedProjectId, branchId || selectedBranchId, run.run_id);
     } catch (error) {
       message.error(error instanceof Error ? error.message : '分析任务失败');
+    } finally {
+      setServiceBusy(false);
+    }
+  };
+
+  const handleSyncSelectedProject = async () => {
+    if (!selectedProjectId) {
+      message.warning('请先选择项目');
+      return;
+    }
+    setServiceBusy(true);
+    try {
+      const synced = await syncProject(selectedProjectId);
+      await applyProjectSyncState(synced, selectedBranchId);
+      if (synced.added_branches.length > 0) {
+        message.success(`项目已同步，发现 ${synced.added_branches.length} 个新分支`);
+      } else {
+        message.success('项目已同步，暂无新增分支');
+      }
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '同步项目失败');
     } finally {
       setServiceBusy(false);
     }
@@ -897,156 +968,164 @@ const App: React.FC = () => {
 
       <Content>
         <Space direction="vertical" size="large" style={{ width: '100%' }}>
-          <Card title={<span><ApiOutlined /> Git 服务模式</span>} extra={<Button icon={<ReloadOutlined />} onClick={() => bootstrapService().catch(() => undefined)} loading={serviceBusy}>刷新服务</Button>}>
-            <Alert
-              type={serviceAvailable === false ? 'error' : serviceAvailable ? 'success' : 'info'}
-              message={serviceAvailable === false ? '后端服务不可用' : serviceAvailable ? '后端服务可用' : '正在检查后端服务'}
-              description={serviceHint}
-              showIcon
-              style={{ marginBottom: 16 }}
-            />
+          {dataSourceMode === 'service' ? (
+            <Card title={<span><ApiOutlined /> Git 服务模式</span>} extra={<Button icon={<ReloadOutlined />} onClick={() => bootstrapService().catch(() => undefined)} loading={serviceBusy}>刷新服务</Button>}>
+              <Alert
+                type={serviceAvailable === false ? 'error' : serviceAvailable ? 'success' : 'info'}
+                message={serviceAvailable === false ? '后端服务不可用' : serviceAvailable ? '后端服务可用' : '正在检查后端服务'}
+                description={serviceHint}
+                showIcon
+                style={{ marginBottom: 16 }}
+              />
 
-            <Row gutter={16}>
-              <Col span={12}>
-                <Card title="新增 Git 项目并立即分析" size="small" bordered={false}>
-                  <Space direction="vertical" style={{ width: '100%' }}>
-                    <Input placeholder="项目名称（可选）" value={newProjectName} onChange={event => setNewProjectName(event.target.value)} />
-                    <Input placeholder="Git 地址，例如 /tmp/demo-repo 或 https://..." value={newGitUrl} onChange={event => setNewGitUrl(event.target.value)} />
-                    <Input placeholder="默认分支" value={newDefaultBranch} onChange={event => setNewDefaultBranch(event.target.value)} />
-                    <Button type="primary" loading={serviceBusy} onClick={handleCreateProject} disabled={serviceAvailable !== true}>
-                      创建项目并开始分析
-                    </Button>
-                  </Space>
-                </Card>
-              </Col>
-              <Col span={12}>
-                <Card title="项目与分支管理" size="small" bordered={false}>
-                  <Space direction="vertical" style={{ width: '100%' }}>
-                    <Select
-                      placeholder="选择项目"
-                      value={selectedProjectId}
-                      onChange={handleProjectChange}
-                      options={projects.map(project => ({
-                        label: `${project.name} (${project.default_branch})`,
-                        value: project.id
-                      }))}
-                      disabled={serviceAvailable !== true || projects.length === 0}
-                    />
-                    <Select
-                      placeholder="选择分支"
-                      value={selectedBranchId}
-                      onChange={handleBranchChange}
-                      options={branches.map(branch => ({
-                        label: branch.is_default ? `${branch.branch_name} (默认)` : branch.branch_name,
-                        value: branch.id
-                      }))}
-                      disabled={!selectedProjectId || branches.length === 0}
-                    />
-                    <Space.Compact style={{ width: '100%' }}>
-                      <Input placeholder="新增分支，例如 release/1.0" value={newBranchName} onChange={event => setNewBranchName(event.target.value)} />
-                      <Button onClick={handleCreateBranch} disabled={!selectedProjectId || serviceAvailable !== true}>新增分支</Button>
-                    </Space.Compact>
-                    <Space wrap>
-                      <Button type="primary" loading={serviceBusy} onClick={() => handleAnalyzeSelectedBranch(false)} disabled={!selectedProjectId || !selectedBranchId || serviceAvailable !== true}>
-                        更新分析
-                      </Button>
-                      <Button loading={serviceBusy} onClick={() => handleAnalyzeSelectedBranch(true)} disabled={!selectedProjectId || !selectedBranchId || serviceAvailable !== true}>
-                        强制重算
-                      </Button>
-                      <Button
-                        danger
-                        onClick={handleCancelActiveRun}
-                        disabled={!activeRun || !activeRunStatuses.has(activeRun.status) || activeRun.cancel_requested}
-                      >
-                        停止分析
-                      </Button>
-                      <Button onClick={() => {
-                        if (selectedProjectId && selectedBranchId) {
-                          loadLatestResult(selectedProjectId, selectedBranchId).catch(error => {
-                            message.error(error instanceof Error ? error.message : '加载结果失败');
-                          });
-                        }
-                      }} disabled={!selectedProjectId || !selectedBranchId}>
-                        加载最新结果
-                      </Button>
-                      <Button onClick={handleClearSelectedProjectCache} disabled={!selectedProjectId || serviceAvailable !== true}>
-                        清理缓存
-                      </Button>
-                      <Button danger onClick={handleDeleteSelectedProject} disabled={!selectedProjectId || serviceAvailable !== true}>
-                        删除项目
+              <Row gutter={16}>
+                <Col span={12}>
+                  <Card title="新增 Git 项目并立即分析" size="small" bordered={false}>
+                    <Space direction="vertical" style={{ width: '100%' }}>
+                      <Input placeholder="项目名称（可选）" value={newProjectName} onChange={event => setNewProjectName(event.target.value)} />
+                      <Input placeholder="Git 地址，例如 /tmp/demo-repo 或 https://..." value={newGitUrl} onChange={event => setNewGitUrl(event.target.value)} />
+                      <Input placeholder="默认分支" value={newDefaultBranch} onChange={event => setNewDefaultBranch(event.target.value)} />
+                      <Button type="primary" loading={serviceBusy} onClick={handleCreateProject} disabled={serviceAvailable !== true}>
+                        创建项目并开始分析
                       </Button>
                     </Space>
-                  </Space>
+                  </Card>
+                </Col>
+                <Col span={12}>
+                  <Card title="项目与分支管理" size="small" bordered={false}>
+                    <Space direction="vertical" style={{ width: '100%' }}>
+                      <Select
+                        placeholder="选择项目"
+                        value={selectedProjectId}
+                        onChange={handleProjectChange}
+                        options={projects.map(project => ({
+                          label: `${project.name} (${project.default_branch})`,
+                          value: project.id
+                        }))}
+                        disabled={serviceAvailable !== true || projects.length === 0}
+                      />
+                      <Select
+                        placeholder="选择分支"
+                        value={selectedBranchId}
+                        onChange={handleBranchChange}
+                        options={branches.map(branch => ({
+                          label: branch.is_default ? `${branch.branch_name} (默认)` : branch.branch_name,
+                          value: branch.id
+                        }))}
+                        disabled={!selectedProjectId || branches.length === 0}
+                      />
+                      <Space.Compact style={{ width: '100%' }}>
+                        <Input placeholder="新增分支，例如 release/1.0" value={newBranchName} onChange={event => setNewBranchName(event.target.value)} />
+                        <Button onClick={handleCreateBranch} disabled={!selectedProjectId || serviceAvailable !== true}>新增分支</Button>
+                      </Space.Compact>
+                      <Space wrap>
+                        <Button type="primary" loading={serviceBusy} onClick={() => handleAnalyzeSelectedBranch(false)} disabled={!selectedProjectId || !selectedBranchId || serviceAvailable !== true}>
+                          更新分析
+                        </Button>
+                        <Button loading={serviceBusy} onClick={handleSyncSelectedProject} disabled={!selectedProjectId || serviceAvailable !== true}>
+                          同步项目分支
+                        </Button>
+                        <Button loading={serviceBusy} onClick={() => handleAnalyzeSelectedBranch(true)} disabled={!selectedProjectId || !selectedBranchId || serviceAvailable !== true}>
+                          强制重算
+                        </Button>
+                        <Button
+                          danger
+                          onClick={handleCancelActiveRun}
+                          disabled={!activeRun || !activeRunStatuses.has(activeRun.status) || activeRun.cancel_requested}
+                        >
+                          停止分析
+                        </Button>
+                        <Button onClick={() => {
+                          if (selectedProjectId && selectedBranchId) {
+                            loadLatestResult(selectedProjectId, selectedBranchId).catch(error => {
+                              message.error(error instanceof Error ? error.message : '加载结果失败');
+                            });
+                          }
+                        }} disabled={!selectedProjectId || !selectedBranchId}>
+                          加载最新结果
+                        </Button>
+                        <Button onClick={handleClearSelectedProjectCache} disabled={!selectedProjectId || serviceAvailable !== true}>
+                          清理缓存
+                        </Button>
+                        <Button danger onClick={handleDeleteSelectedProject} disabled={!selectedProjectId || serviceAvailable !== true}>
+                          删除项目
+                        </Button>
+                      </Space>
+                    </Space>
+                  </Card>
+                </Col>
+              </Row>
+
+              <Space wrap style={{ marginTop: 16 }}>
+                {selectedProject ? <Tag color="blue">项目: {selectedProject.name}</Tag> : null}
+                {selectedProject ? <Tag color="gold">分支数: {selectedProject.branch_count}</Tag> : null}
+                {selectedBranch ? <Tag color="cyan">分支: {selectedBranch.branch_name}</Tag> : null}
+                {selectedBranch?.last_commit_sha ? <Tag color="geekblue">最近 Commit: {selectedBranch.last_commit_sha.slice(0, 8)}</Tag> : null}
+                {selectedBranch?.last_analyzed_at ? <Tag color="purple">最近分析: {formatTime(selectedBranch.last_analyzed_at)}</Tag> : null}
+                {cacheInfo ? <Tag color={cacheInfo.exists ? 'green' : 'default'}>缓存: {cacheInfo.exists ? formatBytes(cacheInfo.size_bytes) : '未生成'}</Tag> : null}
+                {cacheInfo?.last_fetched_at ? <Tag color="gold">最近 fetch: {formatTime(cacheInfo.last_fetched_at)}</Tag> : null}
+              </Space>
+            </Card>
+          ) : null}
+
+          {dataSourceMode === 'csv' ? (
+            <Row gutter={16}>
+              <Col span={10}>
+                <Card title="CSV 兼容模式">
+                  <Dragger
+                    multiple
+                    directory
+                    accept=".csv"
+                    beforeUpload={(file, fileList) => {
+                      if (fileList.indexOf(file) === 0) {
+                        handleFileUpload(fileList);
+                      }
+                      return false;
+                    }}
+                    showUploadList={false}
+                    style={{ height: '150px' }}
+                  >
+                    <p className="ant-upload-drag-icon"><InboxOutlined /></p>
+                    <p className="ant-upload-text">点击或拖拽 <b>CSV 文件 / 文件夹</b></p>
+                  </Dragger>
+                </Card>
+              </Col>
+              <Col span={14}>
+                <Card title={<span><SettingOutlined /> CSV 工程归类管理</span>} size="small" style={{ height: '214px', overflowY: 'auto' }}>
+                  <List
+                    size="small"
+                    dataSource={rawFiles}
+                    locale={{ emptyText: '暂无 CSV 文件' }}
+                    renderItem={file => (
+                      <List.Item
+                        actions={[
+                          <Button
+                            key={`delete-${file.name}`}
+                            type="link"
+                            danger
+                            icon={<DeleteOutlined />}
+                            onClick={() => setRawFiles(previous => previous.filter(item => item.name !== file.name))}
+                          />
+                        ]}
+                      >
+                        <Space>
+                          <Text code>{file.name}</Text>
+                          <Input
+                            size="small"
+                            value={file.groupName}
+                            onChange={event => setRawFiles(previous => previous.map(item => (
+                              item.name === file.name ? { ...item, groupName: event.target.value } : item
+                            )))}
+                            style={{ width: 160 }}
+                          />
+                        </Space>
+                      </List.Item>
+                    )}
+                  />
                 </Card>
               </Col>
             </Row>
-
-            <Space wrap style={{ marginTop: 16 }}>
-              {selectedProject ? <Tag color="blue">项目: {selectedProject.name}</Tag> : null}
-              {selectedBranch ? <Tag color="cyan">分支: {selectedBranch.branch_name}</Tag> : null}
-              {selectedBranch?.last_commit_sha ? <Tag color="geekblue">最近 Commit: {selectedBranch.last_commit_sha.slice(0, 8)}</Tag> : null}
-              {selectedBranch?.last_analyzed_at ? <Tag color="purple">最近分析: {formatTime(selectedBranch.last_analyzed_at)}</Tag> : null}
-              {cacheInfo ? <Tag color={cacheInfo.exists ? 'green' : 'default'}>缓存: {cacheInfo.exists ? formatBytes(cacheInfo.size_bytes) : '未生成'}</Tag> : null}
-              {cacheInfo?.last_fetched_at ? <Tag color="gold">最近 fetch: {formatTime(cacheInfo.last_fetched_at)}</Tag> : null}
-            </Space>
-          </Card>
-
-          <Row gutter={16}>
-            <Col span={10}>
-              <Card title="CSV 兼容模式" extra={<Button onClick={() => setDataSourceMode('csv')} disabled={!localStats}>切换到 CSV</Button>}>
-                <Dragger
-                  multiple
-                  directory
-                  accept=".csv"
-                  beforeUpload={(file, fileList) => {
-                    if (fileList.indexOf(file) === 0) {
-                      handleFileUpload(fileList);
-                    }
-                    return false;
-                  }}
-                  showUploadList={false}
-                  style={{ height: '150px' }}
-                >
-                  <p className="ant-upload-drag-icon"><InboxOutlined /></p>
-                  <p className="ant-upload-text">点击或拖拽 <b>CSV 文件 / 文件夹</b></p>
-                </Dragger>
-              </Card>
-            </Col>
-            <Col span={14}>
-              <Card title={<span><SettingOutlined /> CSV 工程归类管理</span>} size="small" style={{ height: '214px', overflowY: 'auto' }}>
-                <List
-                  size="small"
-                  dataSource={rawFiles}
-                  locale={{ emptyText: '暂无 CSV 文件' }}
-                  renderItem={file => (
-                    <List.Item
-                      actions={[
-                        <Button
-                          key={`delete-${file.name}`}
-                          type="link"
-                          danger
-                          icon={<DeleteOutlined />}
-                          onClick={() => setRawFiles(previous => previous.filter(item => item.name !== file.name))}
-                        />
-                      ]}
-                    >
-                      <Space>
-                        <Text code>{file.name}</Text>
-                        <Input
-                          size="small"
-                          value={file.groupName}
-                          onChange={event => setRawFiles(previous => previous.map(item => (
-                            item.name === file.name ? { ...item, groupName: event.target.value } : item
-                          )))}
-                          style={{ width: 160 }}
-                        />
-                      </Space>
-                    </List.Item>
-                  )}
-                />
-              </Card>
-            </Col>
-          </Row>
+          ) : null}
 
           {serviceBusy && dataSourceMode === 'service' ? (
             <Card>
