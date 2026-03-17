@@ -30,6 +30,7 @@ Project 1 --- N ProjectBranch 1 --- N AnalysisRun
 | `default_branch` | text | 默认分支 |
 | `local_repo_path` | text | 本地仓库缓存路径 |
 | `status` | text | 项目状态 |
+| `last_fetched_at` | datetime | 最近一次 fetch 时间 |
 | `created_at` | datetime | 创建时间 |
 | `updated_at` | datetime | 更新时间 |
 
@@ -86,6 +87,8 @@ Project 1 --- N ProjectBranch 1 --- N AnalysisRun
 | `branch_id` | integer | 所属分支 |
 | `trigger_type` | text | 触发方式 |
 | `status` | text | 运行状态 |
+| `cancel_requested` | boolean | 是否已请求取消 |
+| `requested_ref` | text | 指定分析的 ref 或 commit |
 | `commit_sha` | text | 本次分析 commit |
 | `result_json_path` | text | JSON 结果路径 |
 | `result_csv_path` | text | CSV 结果路径 |
@@ -116,6 +119,7 @@ Project 1 --- N ProjectBranch 1 --- N AnalysisRun
 
 - `manual_update` 强调先检查远端更新，再决定是否执行分析。
 - `manual_reanalyze` 强调即使 commit 未变化也可强制重新生成结果。
+- `cancel_requested` 用于支持安全停止运行中的任务。
 
 ## 6. repo_cache
 
@@ -190,6 +194,12 @@ JSON 结构建议：
 - `git fetch origin`
 - `git log origin/main --numstat ...`
 - `git log origin/release/1.2 --numstat ...`
+
+分支发现策略：
+
+- 创建项目时自动扫描远端分支并落库
+- 手动同步项目时重新扫描远端分支
+- 点击更新分析时也会先做一次远端分支同步
 
 这样有几个好处：
 

@@ -1,75 +1,139 @@
-# 研发效能深度分析看板 (R&D Efficiency Analytics Dashboard)
+# 研发效能代码分析服务
 
-这是一个集 **“自动化数据采集”** 与 **“多维可视化分析”** 于一体的研发效能工具套件。它可以自动从 Git 仓库中提取统计数据，并通过基于 React 的看板进行直观展示与 AI 智能洞察。
+这是一个以 Git 仓库为输入的研发效能分析服务。输入仓库地址后，系统会自动拉取代码、发现远端分支、执行分析，并把结果持久化到本地，前端看板直接消费后端结果。
 
-## 🌟 核心特性
+当前产品有两个模式：
 
-- **📈 全自动化采集**：提供 Python 脚本，一键扫描数百个 Git 仓库，自动过滤“脏提交”并按工程归类。
-- **🤖 AI 智能分析**：集成 LLM（如 DeepSeek），支持按全工程、特定工程或特定人员生成深度效能报告。
-- **🚀 零配置启动**：自带 Windows 批处理脚本，自动安装环境，局域网内一键分享。
-- **👥 身份归一化**：通过 `author_mapping.json` 完美解决一名开发者拥有多个工号/别名的问题。
-- **📂 目录深度感知**：自动将文件所在的直接父文件夹识别为“顶级工程”。
+- `服务模式`
+  - 主模式。通过 Git 地址创建项目，管理分支，触发更新分析，查看任务状态和最新结果。
+- `CSV 模式`
+  - 兼容模式。保留本地 CSV 导入与展示能力，方便继续复用旧数据。
 
----
+## 当前能力
 
-## 🛠️ 第一步：数据采集 (Python 脚本)
+- 输入 Git 地址后自动创建项目并同步远端分支
+- 一个仓库对应一个项目，一个项目下管理多个分支
+- 点击 `更新分析` 时自动 `fetch` 并重新同步远端分支
+- 支持单独点击 `同步项目分支`，不跑分析也能刷新分支列表
+- 后端后台执行分析任务，页面刷新后可继续轮询已有任务
+- 支持停止分析、清理本地缓存、删除项目数据
+- 结果持久化到 `storage/`，页面刷新后可直接读取最近结果
 
-在使用看板前，您需要先从 Git 仓库中提取统计数据。
+## 运行环境
 
-### 1. 前置要求
-- 安装 **Python 3.x**
-- 确保 **Git** 命令在系统环境变量中
+- Node.js 18+
+- Git
+- Python 虚拟环境：`/root/Xpod_Web/xpod/bin/python`
+- Python 包需安装在上述虚拟环境中；缺包时在该虚拟环境里补装
 
-### 2. 运行采集脚本
-将 `analyze_repos.py` 放在您的源码根目录或本项目根目录下运行：
+## 快速启动
+
+首次安装前端依赖：
 
 ```bash
-# 基本运行：扫描当前目录下的 Git 仓库，结果保存到 ./data
-python analyze_repos.py
-
-# 进阶运行：指定源码目录、保存目录及搜索深度
-python analyze_repos.py --src C:/Work/Source --dest ./data --depth 2 --max-lines 2000
+npm install
 ```
 
-### 3. 参数说明
-- `--src`: 源码所在的根目录（脚本会递归搜索其中的 `.git` 文件夹）。
-- `--dest`: 生成的 CSV 存放目录（建议设为本项目的 `data` 目录）。
-- `--depth`: 搜索 Git 仓库的递归深度（默认 2）。
-- `--max-lines`: **核心过滤参数**（默认 2000）。单次提交超过此行数的记录将被忽略，有效排除引入第三方库、代码迁移或自动生成代码的干扰。
+启动前后端服务：
 
----
+```bash
+./scripts/restart_services.sh
+```
 
-## 🖥️ 第二步：开启看板 (React 应用)
+默认端口：
 
-### 1. 启动方式
-双击项目根目录下的 **`start_dashboard.bat`** (或 Win11 专用的 `start_dashboard_for_win11.bat`)。
+- 前端：`3199`
+- 后端：`8011`
 
-### 2. 核心功能操作
-- **工程维度**：在顶部“统计工程”中点选或全选要分析的工程。
-- **指标切换**：右上角可一键切换“新增行数”、“删除行数”、“净增行数”。
-- **人员归一化**：编辑根目录下的 `author_mapping.json`，格式为 `{"工号": "真实姓名"}`，保存后刷新页面即可合并。
-- **AI 分析**：在“AI 分析”标签页填入 API Key，选择分析模式（概览/工程/人员），输入您关心的焦点问题，点击生成报告。
+常用运维脚本：
 
----
+```bash
+./scripts/status_services.sh
+./scripts/stop_services.sh
+```
 
-## 📁 目录结构约定
+日志文件：
+
+- 后端：`/tmp/code-analyze-backend.log`
+- 前端：`/tmp/code-analyze-frontend.log`
+
+## 手工启动
+
+后端：
+
+```bash
+nohup setsid /root/Xpod_Web/xpod/bin/python -m uvicorn app.main:app --app-dir backend --host 0.0.0.0 --port 8011 </dev/null > /tmp/code-analyze-backend.log 2>&1 &
+```
+
+前端：
+
+```bash
+nohup setsid npm run dev </dev/null > /tmp/code-analyze-frontend.log 2>&1 &
+```
+
+说明：
+
+- `vite.config.ts` 默认监听 `3199`
+- 前端 `/api` 会代理到 `http://127.0.0.1:8011`
+
+## 数据存储
+
+运行时数据位于 `storage/`：
+
+```text
+storage/
+├── app.db
+├── repos/
+│   └── <project_id>/repo
+└── results/
+    └── <project_id>/<safe_branch_name>/<run_id>.json
+```
+
+持久化策略：
+
+- 仓库代码缓存和分析结果分离存储
+- 一个项目只保留一份本地 Git 缓存
+- 每次分析生成一份独立 JSON 结果文件
+- 删除项目时同时删除本地缓存、结果文件和数据库记录
+
+## 典型流程
+
+1. 在前端 `服务模式` 中输入 Git 地址创建项目
+2. 系统自动拉取仓库并发现远端分支
+3. 选择分支后点击 `更新分析`
+4. 如远端新增分支，可点击 `同步项目分支` 或再次执行 `更新分析`
+5. 分析完成后直接在看板查看最新结果
+
+## 开发校验
+
+后端静态校验：
+
+```bash
+source /root/Xpod_Web/xpod/bin/activate
+python -m compileall backend
+```
+
+前端构建校验：
+
+```bash
+npm run build
+```
+
+## 目录说明
 
 ```text
 code_analyze/
-├── analyze_repos.py      <-- 采集工具
-├── author_mapping.json   <-- 人员映射配置
-├── data/                 <-- 采集工具生成的 CSV 存放在此
-│   ├── 项目A_stats.csv    <-- 自动识别为工程A
-│   └── 项目B_stats.csv    <-- 自动识别为工程B
-├── src/                  <-- 看板源码
-└── start_dashboard.bat   <-- 启动脚本
+├── backend/                  # FastAPI 后端
+├── docs/                     # 设计与部署文档
+├── scripts/                  # 启停与状态脚本
+├── src/                      # React 前端
+├── analyze_repos.py          # 旧版离线 CSV 分析脚本
+├── author_mapping.json       # 作者映射
+└── storage/                  # 运行时数据
 ```
 
----
+## 历史兼容说明
 
-## 🤝 团队共享
-
-脚本启动后会显示：
-> `局域网其他同事可通过此地址访问: http://192.168.x.x:3000`
-
-直接将此链接发给同事，他们即可查看您采集好的最新研发数据，无需安装任何环境。
+- `analyze_repos.py` 和 `CSV 模式` 仍可继续使用
+- `start_dashboard.bat`、`start_dashboard_for_win11.bat` 属于旧版本地 CSV 启动方式，不再是当前主路径
+- 当前主路径是 `Git 服务模式 + 后端持久化`

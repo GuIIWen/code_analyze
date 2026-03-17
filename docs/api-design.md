@@ -3,7 +3,7 @@
 ## 1. 设计目标
 
 - 前端只通过 API 管理项目、分支和分析任务。
-- 前端不再直接读取本地 `data` 目录。
+- 前端服务模式不再直接读取本地 `data` 目录。
 - 接口返回的数据应能直接支撑现有看板展示。
 
 ## 2. 基础约定
@@ -60,15 +60,34 @@
     "name": "order-service",
     "git_url": "https://example.com/order-service.git",
     "default_branch": "main",
-    "status": "active"
+    "status": "active",
+    "default_branch_record": {
+      "id": 11,
+      "branch_name": "main",
+      "is_default": true
+    },
+    "branches": [
+      {
+        "id": 11,
+        "branch_name": "main",
+        "is_default": true
+      }
+    ],
+    "added_branches": [
+      {
+        "id": 11,
+        "branch_name": "main",
+        "is_default": true
+      }
+    ]
   }
 }
 ```
 
 说明：
 
-- 创建项目时只创建配置，不强制立即 clone。
-- 可在创建后自动补建一个默认分支记录。
+- 创建项目时会尝试 clone 或 fetch 仓库并同步远端分支。
+- 返回体会直接包含当前分支列表和默认分支记录。
 
 ### 3.2 查询项目列表
 
@@ -105,20 +124,34 @@
 - `git_url` 如需修改，应谨慎处理，避免和原缓存目录产生冲突。
 - 第一版建议不支持直接修改 `git_url`，需要时走“新建项目”。
 
-### 3.5 删除项目
+### 3.5 同步项目分支
+
+`POST /api/projects/{project_id}/sync`
+
+行为：
+
+1. 对本地仓库执行 `fetch`；首次不存在时执行 `clone`
+2. 重新扫描远端分支
+3. 把新增分支写入数据库
+4. 返回最新项目信息、分支列表和本次新增分支
+
+用途：
+
+- 项目创建后远端新增了分支
+- 页面上需要手动刷新分支下拉
+- 不想顺带触发分析
+
+### 3.6 删除项目
 
 `DELETE /api/projects/{project_id}`
 
 Query 参数：
 
 - `mode=full`
-- `mode=metadata_only`
 
 建议第一版只提供：
 
 - `mode=full`，彻底删除项目及其本地缓存和结果。
-
-如果要更安全，可拆成独立接口处理不同删除动作。
 
 ## 4. 分支管理接口
 
@@ -184,12 +217,13 @@ Query 参数：
 
 行为：
 
-1. 检查本地仓库缓存。
-2. 没有缓存则 clone。
-3. 有缓存则 fetch。
-4. 解析远端最新 commit。
-5. 如 commit 未变化且 `force=false`，直接复用最近结果。
-6. 否则创建新的分析任务。
+1. 先同步项目远端分支，保证新增分支可见。
+2. 检查本地仓库缓存。
+3. 没有缓存则 clone。
+4. 有缓存则 fetch。
+5. 解析远端最新 commit。
+6. 如 commit 未变化且 `force=false`，直接复用最近结果。
+7. 否则创建新的分析任务。
 
 返回：
 
@@ -197,11 +231,27 @@ Query 参数：
 {
   "success": true,
   "data": {
+    "project": {
+      "id": 1,
+      "name": "order-service"
+    },
+    "branches": [],
+    "added_branches": [],
+    "default_branch_record": {
+      "id": 11,
+      "branch_name": "main",
+      "is_default": true
+    },
     "run_id": 1001,
     "status": "queued"
   }
 }
 ```
+
+说明：
+
+- 前端可直接根据返回体刷新项目和分支状态。
+- 如果远端刚新增了分支，`added_branches` 会体现出来。
 
 ### 5.2 强制重新分析
 
@@ -254,7 +304,16 @@ Query 参数：
 }
 ```
 
-### 5.5 查询单次运行结果
+### 5.5 停止运行中的任务
+
+`POST /api/runs/{run_id}/cancel`
+
+行为：
+
+- 队列中的任务会直接标记为 `canceled`
+- 执行中的任务会记录 `cancel_requested=true`，等待 Git/分析过程安全退出
+
+### 5.6 查询单次运行结果
 
 `GET /api/runs/{run_id}/result`
 
