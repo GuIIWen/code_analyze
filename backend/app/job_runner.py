@@ -10,6 +10,7 @@ import shutil
 from app.analyzer.git_analyzer import analyze_git_reference
 from app.config import Settings
 from app.git_client import (
+    GitCommandCanceled,
     GitCommandError,
     clone_repository,
     fetch_repository,
@@ -110,6 +111,14 @@ class JobRunner:
         run = self.repository.get_run(run_id)
         if not run:
             return
+        if bool(run.get("cancel_requested")) or run["status"] == "canceled":
+            self.repository.update_run(
+                run_id,
+                status="canceled",
+                finished_at=utc_now(),
+                error_message="run canceled by user",
+            )
+            return
         project = self.repository.get_project(run["project_id"])
         branch = self.repository.get_branch(run["branch_id"], run["project_id"])
         if not project or not branch:
@@ -125,19 +134,31 @@ class JobRunner:
         self.repository.update_run(run_id, status="cloning", started_at=started_at, error_message=None)
 
         repo_path = Path(project["local_repo_path"])
+        cancel_check = lambda: self._is_cancel_requested(run_id)
 
         try:
             if repo_path.exists():
                 self.repository.update_run(run_id, status="fetching")
-                fetch_repository(self.settings.git_bin, repo_path)
+                fetch_repository(self.settings.git_bin, repo_path, cancel_check=cancel_check)
             else:
-                clone_repository(self.settings.git_bin, project["git_url"], repo_path)
+                clone_repository(
+                    self.settings.git_bin,
+                    project["git_url"],
+                    repo_path,
+                    cancel_check=cancel_check,
+                )
 
             self.repository.update_project(project["id"], last_fetched_at=utc_now())
+            self._raise_if_canceled(run_id)
 
             requested_ref = run.get("requested_ref")
             target_ref = requested_ref or f"origin/{branch['branch_name']}"
-            commit_sha = resolve_git_ref(self.settings.git_bin, repo_path, target_ref)
+            commit_sha = resolve_git_ref(
+                self.settings.git_bin,
+                repo_path,
+                target_ref,
+                cancel_check=cancel_check,
+            )
 
             latest_success = self.repository.get_latest_success_run(branch["id"])
             can_reuse = (
@@ -169,6 +190,7 @@ class JobRunner:
                 return
 
             self.repository.update_run(run_id, status="analyzing", commit_sha=commit_sha)
+            self._raise_if_canceled(run_id)
 
             result = analyze_git_reference(
                 git_bin=self.settings.git_bin,
@@ -180,6 +202,7 @@ class JobRunner:
                 commit_sha=commit_sha,
                 run_id=run_id,
                 max_lines=branch_max_lines(branch, self.settings.default_max_lines),
+                cancel_check=cancel_check,
             )
 
             result["projectMeta"].update(
@@ -218,6 +241,13 @@ class JobRunner:
                 last_result_path=str(output_path),
                 last_analyzed_at=finished_at,
             )
+        except GitCommandCanceled:
+            self.repository.update_run(
+                run_id,
+                status="canceled",
+                error_message="run canceled by user",
+                finished_at=utc_now(),
+            )
         except GitCommandError as exc:
             self.repository.update_run(
                 run_id,
@@ -233,3 +263,12 @@ class JobRunner:
                 finished_at=utc_now(),
             )
 
+    def _is_cancel_requested(self, run_id: int) -> bool:
+        run = self.repository.get_run(run_id)
+        if not run:
+            return True
+        return bool(run.get("cancel_requested")) or run["status"] == "canceled"
+
+    def _raise_if_canceled(self, run_id: int) -> None:
+        if self._is_cancel_requested(run_id):
+            raise GitCommandCanceled("run canceled by user")

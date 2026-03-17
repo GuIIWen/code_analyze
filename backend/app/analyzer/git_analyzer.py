@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,7 @@ def analyze_git_reference(
     commit_sha: str,
     run_id: int,
     max_lines: int,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     output = run_git_command(
         git_bin,
@@ -29,6 +31,7 @@ def analyze_git_reference(
             ref,
         ],
         cwd=repo_path,
+        cancel_check=cancel_check,
     )
 
     stats: dict[tuple[str, str], dict[str, int]] = defaultdict(
@@ -166,4 +169,3 @@ def analyze_git_reference(
         "authorProjectStats": author_project_stats,
         "fullData": records,
     }
-

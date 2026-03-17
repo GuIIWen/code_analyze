@@ -51,6 +51,7 @@ export interface RunSummary {
   branch_id: number;
   trigger_type: string;
   status: string;
+  cancel_requested: boolean;
   requested_ref?: string | null;
   commit_sha?: string | null;
   result_json_path?: string | null;
@@ -137,7 +138,12 @@ export const triggerBranchReanalyze = (
   method: 'POST',
   body: JSON.stringify({ commit_sha: commitSha || null })
 });
+export const listBranchRuns = (projectId: number, branchId: number) =>
+  request<RunSummary[]>(`/projects/${projectId}/branches/${branchId}/runs`);
 export const getRun = (runId: number) => request<RunSummary>(`/runs/${runId}`);
+export const cancelRun = (runId: number) => request<RunSummary>(`/runs/${runId}/cancel`, {
+  method: 'POST'
+});
 export const getRunResult = (runId: number) => request<DashboardStats>(`/runs/${runId}/result`);
 export const getLatestBranchResult = (projectId: number, branchId: number) =>
   request<DashboardStats>(`/projects/${projectId}/branches/${branchId}/result/latest`);

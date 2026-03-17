@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS analysis_runs (
     branch_id INTEGER NOT NULL,
     trigger_type TEXT NOT NULL,
     status TEXT NOT NULL,
+    cancel_requested INTEGER NOT NULL DEFAULT 0,
     requested_ref TEXT,
     commit_sha TEXT,
     result_json_path TEXT,
@@ -96,6 +97,16 @@ class Repository:
     def initialize(self) -> None:
         with self.connection() as conn:
             conn.executescript(SCHEMA)
+            self._ensure_analysis_runs_columns(conn)
+
+    def _ensure_analysis_runs_columns(self, conn: sqlite3.Connection) -> None:
+        columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(analysis_runs)").fetchall()
+        }
+        if "cancel_requested" not in columns:
+            conn.execute(
+                "ALTER TABLE analysis_runs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0"
+            )
 
     def mark_incomplete_runs_failed(self) -> None:
         with self.connection() as conn:
@@ -330,15 +341,16 @@ class Repository:
             cursor = conn.execute(
                 """
                 INSERT INTO analysis_runs (
-                    project_id, branch_id, trigger_type, status, requested_ref,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    project_id, branch_id, trigger_type, status, cancel_requested,
+                    requested_ref, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     project_id,
                     branch_id,
                     trigger_type,
                     "queued",
+                    0,
                     requested_ref,
                     timestamp,
                     timestamp,
@@ -356,6 +368,20 @@ class Repository:
             row = conn.execute(
                 "SELECT * FROM analysis_runs WHERE id = ?",
                 (run_id,),
+            ).fetchone()
+        return self._row_to_dict(row)
+
+    def get_latest_active_run(self, branch_id: int) -> dict | None:
+        with self.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM analysis_runs
+                WHERE branch_id = ? AND status IN ('queued', 'cloning', 'fetching', 'analyzing')
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                """,
+                (branch_id,),
             ).fetchone()
         return self._row_to_dict(row)
 
@@ -402,6 +428,23 @@ class Repository:
     def delete_run_record(self, run_id: int) -> None:
         with self.connection() as conn:
             conn.execute("DELETE FROM analysis_runs WHERE id = ?", (run_id,))
+
+    def request_run_cancel(self, run_id: int) -> dict | None:
+        run = self.get_run(run_id)
+        if not run:
+            return None
+
+        if run["status"] in ("succeeded", "failed", "canceled"):
+            return run
+
+        fields = {
+            "cancel_requested": 1,
+        }
+        if run["status"] == "queued":
+            fields["status"] = "canceled"
+            fields["finished_at"] = utc_now()
+            fields["error_message"] = "run canceled by user"
+        return self.update_run(run_id, **fields)
 
     def refresh_branch_latest_success(self, branch_id: int, project_id: int) -> None:
         latest = self.get_latest_success_run(branch_id)

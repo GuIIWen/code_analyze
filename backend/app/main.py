@@ -120,6 +120,7 @@ def serialize_run(run: dict) -> dict:
         "branch_id": run["branch_id"],
         "trigger_type": run["trigger_type"],
         "status": run["status"],
+        "cancel_requested": bool(run.get("cancel_requested")),
         "requested_ref": run.get("requested_ref"),
         "commit_sha": run.get("commit_sha"),
         "result_json_path": run.get("result_json_path"),
@@ -250,7 +251,7 @@ async def get_project(project_id: int):
     branches = repository.list_branches(project_id)
     recent_runs = []
     for branch in branches:
-        latest = repository.get_latest_success_run(branch["id"])
+        latest = repository.get_latest_active_run(branch["id"]) or repository.get_latest_success_run(branch["id"])
         if latest:
             recent_runs.append(serialize_run(latest))
     return success(
@@ -398,6 +399,17 @@ async def get_latest_result(project_id: int, branch_id: int):
 @app.get("/api/runs/{run_id}")
 async def get_run(run_id: int):
     return success(serialize_run(get_run_or_404(run_id)))
+
+
+@app.post("/api/runs/{run_id}/cancel")
+async def cancel_run(run_id: int):
+    run = get_run_or_404(run_id)
+    if run["status"] in ("succeeded", "failed", "canceled"):
+        api_error(409, "RUN_NOT_ACTIVE", "run is not active")
+    updated = repository.request_run_cancel(run_id)
+    if updated is None:
+        api_error(404, "RUN_NOT_FOUND", "run not found")
+    return success(serialize_run(updated))
 
 
 @app.get("/api/runs/{run_id}/result")

@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import {
   Alert,
@@ -40,6 +40,7 @@ import {
   BranchSummary,
   ProjectSummary,
   RunSummary,
+  cancelRun,
   clearProjectCache,
   createBranch,
   createProject,
@@ -49,6 +50,7 @@ import {
   getProjectDetail,
   getRun,
   healthCheck,
+  listBranchRuns,
   listProjects,
   triggerBranchUpdate
 } from './utils/api';
@@ -76,6 +78,10 @@ const runStatusColors: Record<string, string> = {
   failed: 'error',
   canceled: 'warning'
 };
+
+const activeRunStatuses = new Set(['queued', 'cloning', 'fetching', 'analyzing']);
+const selectedProjectStorageKey = 'code_analyze_selected_project_id';
+const selectedBranchStorageKey = 'code_analyze_selected_branch_id';
 
 const isUndefinedValue = (value: unknown) => {
   const text = String(value ?? '').trim().toLowerCase();
@@ -115,6 +121,10 @@ const formatBytes = (value?: number) => {
 };
 
 const App: React.FC = () => {
+  const initialProjectId = Number(localStorage.getItem(selectedProjectStorageKey) || '');
+  const initialBranchId = Number(localStorage.getItem(selectedBranchStorageKey) || '');
+  const pollingRunIdRef = useRef<number | null>(null);
+
   const [rawFiles, setRawFiles] = useState<FileInfo[]>([]);
   const [localStats, setLocalStats] = useState<DashboardStats | null>(null);
   const [remoteStats, setRemoteStats] = useState<DashboardStats | null>(null);
@@ -132,8 +142,8 @@ const App: React.FC = () => {
   const [serviceBusy, setServiceBusy] = useState<boolean>(false);
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [branches, setBranches] = useState<BranchSummary[]>([]);
-  const [selectedProjectId, setSelectedProjectId] = useState<number | undefined>(undefined);
-  const [selectedBranchId, setSelectedBranchId] = useState<number | undefined>(undefined);
+  const [selectedProjectId, setSelectedProjectId] = useState<number | undefined>(Number.isFinite(initialProjectId) ? initialProjectId : undefined);
+  const [selectedBranchId, setSelectedBranchId] = useState<number | undefined>(Number.isFinite(initialBranchId) ? initialBranchId : undefined);
   const [activeRun, setActiveRun] = useState<RunSummary | null>(null);
   const [cacheInfo, setCacheInfo] = useState<{
     local_repo_path: string;
@@ -188,6 +198,21 @@ const App: React.FC = () => {
     }
   };
 
+  const recoverActiveRun = async (projectId: number, branchId: number) => {
+    const runs = await listBranchRuns(projectId, branchId);
+    const active = runs.find(run => activeRunStatuses.has(run.status));
+    if (!active) {
+      setActiveRun(null);
+      return false;
+    }
+
+    setActiveRun(active);
+    if (pollingRunIdRef.current !== active.id) {
+      void pollRunUntilFinished(projectId, branchId, active.id, true);
+    }
+    return true;
+  };
+
   const loadProjectContext = async (
     projectId: number,
     preferredBranchId?: number,
@@ -204,6 +229,7 @@ const App: React.FC = () => {
     if (detail.branches.length === 0) {
       setSelectedBranchId(undefined);
       setRemoteStats(null);
+      setActiveRun(null);
       return;
     }
 
@@ -215,7 +241,8 @@ const App: React.FC = () => {
           : detail.branches.find(branch => branch.is_default)?.id || detail.branches[0].id;
 
     setSelectedBranchId(branchId);
-    if (autoLoadLatestResult) {
+    const hasActiveRun = await recoverActiveRun(projectId, branchId);
+    if (autoLoadLatestResult && !hasActiveRun) {
       await loadLatestResult(projectId, branchId, false);
     }
   };
@@ -258,6 +285,22 @@ const App: React.FC = () => {
       setDataSourceMode('csv');
     }
   };
+
+  useEffect(() => {
+    if (selectedProjectId) {
+      localStorage.setItem(selectedProjectStorageKey, String(selectedProjectId));
+    } else {
+      localStorage.removeItem(selectedProjectStorageKey);
+    }
+  }, [selectedProjectId]);
+
+  useEffect(() => {
+    if (selectedBranchId) {
+      localStorage.setItem(selectedBranchStorageKey, String(selectedBranchId));
+    } else {
+      localStorage.removeItem(selectedBranchStorageKey);
+    }
+  }, [selectedBranchId]);
 
   useEffect(() => {
     const loadLocalData = () => {
@@ -593,23 +636,49 @@ const App: React.FC = () => {
     message.success(`已导入 ${newFiles.length} 个 CSV 文件`);
   };
 
-  const pollRunUntilFinished = async (projectId: number, branchId: number, runId: number) => {
-    message.loading({ key: 'analysis-run', content: '正在执行分析任务...' });
-    for (let attempt = 0; attempt < 90; attempt += 1) {
-      const run = await getRun(runId);
-      setActiveRun(run);
-      if (run.status === 'succeeded') {
-        await refreshProjects(projectId, branchId);
-        await loadLatestResult(projectId, branchId, false);
-        message.success({ key: 'analysis-run', content: '分析完成，结果已加载' });
-        return;
-      }
-      if (run.status === 'failed' || run.status === 'canceled') {
-        throw new Error(run.error_message || `任务状态: ${run.status}`);
-      }
-      await sleep(1500);
+  const pollRunUntilFinished = async (
+    projectId: number,
+    branchId: number,
+    runId: number,
+    silent = false
+  ) => {
+    if (pollingRunIdRef.current === runId) {
+      return;
     }
-    throw new Error('分析任务超时，请稍后手动刷新');
+
+    pollingRunIdRef.current = runId;
+    setServiceBusy(true);
+    if (!silent) {
+      message.loading({ key: 'analysis-run', content: '正在执行分析任务...' });
+    }
+
+    try {
+      for (let attempt = 0; attempt < 120; attempt += 1) {
+        const run = await getRun(runId);
+        setActiveRun(run);
+        if (run.status === 'succeeded') {
+          await refreshProjects(projectId, branchId);
+          await loadLatestResult(projectId, branchId, false);
+          message.success({ key: 'analysis-run', content: '分析完成，结果已加载' });
+          return;
+        }
+        if (run.status === 'canceled') {
+          await refreshProjects(projectId, branchId);
+          message.warning({ key: 'analysis-run', content: '分析任务已停止' });
+          return;
+        }
+        if (run.status === 'failed') {
+          throw new Error(run.error_message || `任务状态: ${run.status}`);
+        }
+        await sleep(1500);
+      }
+      throw new Error('分析任务超时，请稍后手动刷新');
+    } finally {
+      if (pollingRunIdRef.current === runId) {
+        pollingRunIdRef.current = null;
+        setServiceBusy(false);
+      }
+    }
   };
 
   const handleCreateProject = async () => {
@@ -710,6 +779,19 @@ const App: React.FC = () => {
     }
   };
 
+  const handleCancelActiveRun = async () => {
+    if (!activeRun || !activeRunStatuses.has(activeRun.status)) {
+      return;
+    }
+    try {
+      const run = await cancelRun(activeRun.id);
+      setActiveRun(run);
+      message.info('已发送停止请求，等待任务安全退出');
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '停止任务失败');
+    }
+  };
+
   const handleDeleteSelectedProject = async () => {
     if (!selectedProjectId) {
       return;
@@ -769,6 +851,7 @@ const App: React.FC = () => {
             <Tag color="blue">{sourceDescription}</Tag>
             {remoteStats?.runMeta?.commitSha ? <Tag color="geekblue">Commit {remoteStats.runMeta.commitSha.slice(0, 8)}</Tag> : null}
             {activeRun ? <Tag color={runStatusColors[activeRun.status] || 'default'}>任务状态: {activeRun.status}</Tag> : null}
+            {activeRun?.cancel_requested ? <Tag color="orange">停止请求已发送</Tag> : null}
           </Space>
         </Space>
         <Space size="large" wrap>
@@ -869,6 +952,13 @@ const App: React.FC = () => {
                       </Button>
                       <Button loading={serviceBusy} onClick={() => handleAnalyzeSelectedBranch(true)} disabled={!selectedProjectId || !selectedBranchId || serviceAvailable !== true}>
                         强制重算
+                      </Button>
+                      <Button
+                        danger
+                        onClick={handleCancelActiveRun}
+                        disabled={!activeRun || !activeRunStatuses.has(activeRun.status) || activeRun.cancel_requested}
+                      >
+                        停止分析
                       </Button>
                       <Button onClick={() => {
                         if (selectedProjectId && selectedBranchId) {
