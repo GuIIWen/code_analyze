@@ -11,7 +11,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.config import ensure_runtime_dirs, get_settings
-from app.git_client import GitCommandError, directory_size_bytes
+from app.git_client import (
+    GitCommandError,
+    clone_repository,
+    directory_size_bytes,
+    fetch_repository,
+    list_remote_branches,
+    resolve_remote_head_branch,
+)
 from app.job_runner import (
     JobRunner,
     clear_project_cache,
@@ -20,7 +27,7 @@ from app.job_runner import (
     remove_run_artifacts,
     safe_branch_name,
 )
-from app.repository import Repository
+from app.repository import Repository, utc_now
 from app.schemas import (
     BranchCreate,
     BranchReanalyzeRequest,
@@ -152,6 +159,48 @@ def enqueue_run(project_id: int, branch_id: int, trigger_type: str, requested_re
     return run
 
 
+def sync_project_branches(project: dict, preferred_default_branch: str | None = None) -> tuple[list[dict], dict]:
+    repo_path = Path(project["local_repo_path"])
+    if repo_path.exists():
+        fetch_repository(settings.git_bin, repo_path)
+    else:
+        clone_repository(settings.git_bin, project["git_url"], repo_path)
+
+    remote_branches = list_remote_branches(settings.git_bin, repo_path)
+    if not remote_branches:
+        api_error(400, "NO_REMOTE_BRANCHES", "no remote branches found for this repository")
+
+    default_branch_name = preferred_default_branch if preferred_default_branch in remote_branches else None
+    if default_branch_name is None:
+        default_branch_name = resolve_remote_head_branch(settings.git_bin, repo_path)
+    if default_branch_name is None or default_branch_name not in remote_branches:
+        default_branch_name = remote_branches[0]
+
+    for branch_name in remote_branches:
+        existing = repository.get_branch_by_name(project["id"], branch_name)
+        if existing:
+            if branch_name == default_branch_name and not bool(existing["is_default"]):
+                repository.update_branch(existing["id"], project["id"], is_default=True)
+            continue
+        repository.create_branch(
+            project["id"],
+            branch_name,
+            branch_name == default_branch_name,
+            json.dumps({}, ensure_ascii=False),
+        )
+
+    repository.update_project(
+        project["id"],
+        default_branch=default_branch_name,
+        last_fetched_at=utc_now(),
+    )
+    branches = repository.list_branches(project["id"])
+    default_branch = next((branch for branch in branches if bool(branch["is_default"])), None)
+    if default_branch is None:
+        api_error(500, "DEFAULT_BRANCH_MISSING", "default branch was not resolved after sync")
+    return branches, default_branch
+
+
 @app.exception_handler(HTTPException)
 async def handle_http_exception(_: Request, exc: HTTPException):
     detail = exc.detail if isinstance(exc.detail, dict) else {"code": "HTTP_ERROR", "message": str(exc.detail)}
@@ -174,15 +223,14 @@ async def health():
 @app.post("/api/projects")
 async def create_project(payload: ProjectCreate):
     project_name = payload.name or derive_project_name(payload.git_url)
+    project: dict | None = None
     try:
         project = repository.create_project(project_name, payload.git_url, payload.default_branch)
-        branch = repository.create_branch(
-            project["id"],
-            payload.default_branch,
-            True,
-            json.dumps({}, ensure_ascii=False),
-        )
+        _, branch = sync_project_branches(project, payload.default_branch)
     except Exception as exc:
+        if project is not None:
+            remove_project_storage(settings, project)
+            repository.delete_project_record(project["id"])
         if "UNIQUE constraint failed: projects.git_url" in str(exc):
             api_error(409, "PROJECT_EXISTS", "project already exists")
         raise

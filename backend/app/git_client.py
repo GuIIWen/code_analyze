@@ -41,6 +41,37 @@ def resolve_git_ref(git_bin: str, repo_path: Path, ref: str) -> str:
     return run_git_command(git_bin, ["rev-parse", ref], cwd=repo_path)
 
 
+def list_remote_branches(git_bin: str, repo_path: Path) -> list[str]:
+    output = run_git_command(
+        git_bin,
+        ["for-each-ref", "--format=%(refname:strip=3)", "refs/remotes/origin"],
+        cwd=repo_path,
+    )
+    branches = []
+    for line in output.splitlines():
+        branch_name = line.strip()
+        if not branch_name or branch_name == "HEAD":
+            continue
+        branches.append(branch_name)
+    return sorted(set(branches))
+
+
+def resolve_remote_head_branch(git_bin: str, repo_path: Path) -> str | None:
+    try:
+        ref = run_git_command(
+            git_bin,
+            ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+            cwd=repo_path,
+        )
+    except GitCommandError:
+        return None
+
+    prefix = "refs/remotes/origin/"
+    if ref.startswith(prefix):
+        return ref[len(prefix):]
+    return None
+
+
 def directory_size_bytes(path: Path) -> int:
     if not path.exists():
         return 0
@@ -49,4 +80,3 @@ def directory_size_bytes(path: Path) -> int:
         if file_path.is_file():
             total += file_path.stat().st_size
     return total
-
